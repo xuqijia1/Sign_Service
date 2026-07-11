@@ -1,0 +1,15 @@
+{
+    "httpServerPort": 7001,
+    "DeviceType": "cuda",
+    "camera_url": "./sign_test.mp4",
+    "model_path": "./sign.pt",
+    "cls_model_path": "./sign_cls.pt",
+    "cls_conf_threshold": 0.5,
+    "CudaDevice": 0,
+    "confidence_threshold": 0.5,
+    "video_save_dir": "./videos",
+    "client_url": "http://127.0.0.1:8084",
+    "push_interval": 0.5,
+    "show_window": true,
+    "cpu_cores": [12, 13]
+}

@@ -1,0 +1,11 @@
+# Model files
+*.onnx
+*.pt
+
+# Video files
+*.mp4
+videos/
+
+# Python cache
+__pycache__/
+*.pyc
