@@ -1,11 +1,14 @@
 # custom_http_server.py - HTTP服务器
 import json
+import os
 import logging
+from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any
 
 from SharedData import shared_data, DetectionBox, SignResult, get_sign_type
+from VideoStream import JpegFrameRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +128,10 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         # 停止之前的录制
-        if shared_data.video_recorder and shared_data.is_recording:
-            shared_data.video_recorder.stop_recording()
+        vs = shared_data.video_recorder
+        if vs and vs.video_recorder is not None:
+            vs.video_recorder.release()
+            vs.video_recorder = None
 
         # 设置用户ID
         shared_data.current_user_id = userid
@@ -137,16 +142,20 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         shared_data.latest_result = None
         shared_data.frame_count = 0
 
-        # 开始录制
+        # 创建录制器
         video_path = ""
-        if shared_data.video_recorder:
-            video_path = shared_data.video_recorder.start_recording(
-                user_id=userid,
-                width=shared_data.frame_width,
-                height=shared_data.frame_height,
-                fps=shared_data.frame_fps
-            )
-            shared_data.is_recording = True
+        if vs is not None:
+            date_str = datetime.now().strftime("%Y%m%d")
+            time_str = datetime.now().strftime("%H%M%S")
+            video_dir = os.path.join(vs._video_save_dir, date_str, userid)
+            os.makedirs(video_dir, exist_ok=True)
+            video_path = os.path.join(video_dir, f"sign_record_{userid}_{time_str}.mp4")
+            w = shared_data.frame_width if shared_data.frame_width > 0 else 1920
+            h = shared_data.frame_height if shared_data.frame_height > 0 else 1080
+            fps = shared_data.frame_fps if shared_data.frame_fps > 0 else 25.0
+            vs.video_recorder = JpegFrameRecorder(video_path, fps, w, h)
+            logger.info(f"录制器创建成功: {video_path} | {w}x{h} @ {fps:.1f}fps")
+        shared_data.is_recording = True
 
         # 设置运行状态
         shared_data.set_running(True)
@@ -167,8 +176,11 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
 
         # 停止录制
         video_path = ""
-        if shared_data.video_recorder:
-            video_path = shared_data.video_recorder.stop_recording()
+        vs = shared_data.video_recorder
+        if vs and vs.video_recorder is not None:
+            video_path = vs.video_recorder.output_path
+            vs.video_recorder.release()
+            vs.video_recorder = None
 
         # 获取识别结果
         results = shared_data.get_all_results()

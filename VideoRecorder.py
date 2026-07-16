@@ -67,13 +67,13 @@ class VideoRecorder:
             if width is None or height is None:
                 width, height = 1920, 1080
 
-            # 创建日期子目录
+            # 创建日期/用户子目录
             date_dir = datetime.now().strftime("%Y%m%d")
-            full_dir = os.path.join(self.save_dir, date_dir)
+            full_dir = os.path.join(self.save_dir, date_dir, user_id) if user_id else os.path.join(self.save_dir, date_dir)
             os.makedirs(full_dir, exist_ok=True)
 
             # 生成文件名
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%H%M%S")
             user_suffix = f"_{user_id}" if user_id else ""
             base_name = f"sign_record{user_suffix}_{timestamp}"
 

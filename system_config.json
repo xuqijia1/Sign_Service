@@ -7,9 +7,17 @@
     "cls_conf_threshold": 0.5,
     "CudaDevice": 0,
     "confidence_threshold": 0.5,
-    "video_save_dir": "./videos",
+    "video_save_dir": "/home/kickpi/ExamVideos/Sign",
     "client_url": "http://127.0.0.1:8084",
     "push_interval": 0.5,
     "show_window": true,
-    "cpu_cores": [12, 13]
+    "cpu_cores": [12, 13],
+    "dvpp": {
+        "enabled": false,
+        "device_id": 0,
+        "channel_id": null,
+        "en_type": "H264",
+        "out_format": "NV12",
+        "auto_detect_codec": true
+    }
 }

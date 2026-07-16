@@ -129,12 +129,10 @@ def main():
     from VideoStream import VideoStream
     VIDEO_STREAM = VideoStream(config)
     VIDEO_STREAM.start()
-    logger.info(f"视频流处理已启动: {config.get('camera_url')}")
 
     # 启动HTTP服务器
     from custom_http_server import run_server
     port = config.get('httpServerPort', 8090)
-    logger.info(f"HTTP服务器启动，端口: {port}")
     run_server(port=port)
 
 if __name__ == "__main__":
