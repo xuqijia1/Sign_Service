@@ -283,18 +283,21 @@ class VideoStream:
                     device_id=int(self.cuda_device) if self.device_type == 'ascend' else 0,
                     en_type="H264",
                 )
-                if self.dvpp_decoder is not None:
-                    self.use_dvpp = True
-                    self.frame_width = self.dvpp_decoder.src_width or 1920
-                    self.frame_height = self.dvpp_decoder.src_height or 1080
-                    self.frame_fps = self.dvpp_decoder.fps or 25.0
-                    shared_data.frame_width = self.frame_width
-                    shared_data.frame_height = self.frame_height
-                    shared_data.frame_fps = self.frame_fps
-                    logger.info(f"DVPP 硬解码已启动: {self.camera_url} | "
-                                f"{self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f}fps")
+                self.use_dvpp = True
+                self.frame_width = self.dvpp_decoder.src_width or 1920
+                self.frame_height = self.dvpp_decoder.src_height or 1080
+                self.frame_fps = self.dvpp_decoder.fps or 25.0
+                shared_data.frame_width = self.frame_width
+                shared_data.frame_height = self.frame_height
+                shared_data.frame_fps = self.frame_fps
+                logger.info(f"DVPP 硬解码已启动: {self.camera_url} | "
+                            f"{self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f}fps")
+            except RuntimeError as e:
+                logger.warning(f"DVPP 硬解码启动失败({e})，回退 cv2")
+                self.dvpp_decoder = None
+                self.use_dvpp = False
             except Exception as e:
-                logger.warning(f"DVPP 硬解码启动失败，回退 cv2: {e}")
+                logger.warning(f"DVPP 硬解码启动异常({e})，回退 cv2")
                 self.dvpp_decoder = None
                 self.use_dvpp = False
 

@@ -18,6 +18,7 @@ import os
 import time
 import queue
 import threading
+import glob
 import numpy as np
 
 try:
@@ -37,6 +38,8 @@ FMT_NV12 = 1   # PIXEL_FORMAT_YUV_SEMIPLANAR_420
 FMT_BGR  = 13  # PIXEL_FORMAT_BGR_888
 ACL_H2D = 1
 ACL_D2H = 2
+ACL_D2D = 3
+
 
 # VDEC 通道文件锁路径（同容器内多服务自动分配 channel_id）
 _CHANNEL_LOCK_FILE = "/tmp/ascend_vdec_channels.lock"
@@ -264,564 +267,60 @@ class BaseVideoDecoder:
         return False
 
 
-# ==================== Ascend-FFmpeg + VPC 解码器 ====================
+# ==================== CPU 软解码降级方案 ====================
 
-class AscendFFmpegDecoder(BaseVideoDecoder):
-    """Ascend-FFmpeg 硬解码 + VPC 硬件色彩转换
+class Cv2Decoder(BaseVideoDecoder):
+    """OpenCV CPU 软解码降级方案
 
-    VDEC 硬解码输出 NV12 → VPC 硬件转换 NV12→BGR（可选 + resize）
-    全程 NPU 处理，CPU 零色彩转换开销。
-
-    use_vpc=True（默认）: read_frame() 返回 BGR numpy（VPC 硬件转换）
-    use_vpc=False: read_frame() 返回 NV12 dict，由调用方自行转换
+    acl VDEC 不可用时（非昇腾服务器、容器无 PyAV）自动回退。
     """
 
-    # 进程级缓存：RTSP URL → 上次成功检测的编码格式
-    _detected_codec_cache = {}
-
-    def __init__(self, rtsp_url, device_id=0, channel_id=None, en_type="H264",
-                 auto_detect_codec=True, use_vpc=True):
+    def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
-        self.device_id = device_id
-        self._channel_id = channel_id
-        self._allocated_channel = None
-        self._en_type = en_type
-        self._auto_detect_codec = auto_detect_codec
-        self._use_vpc = use_vpc and _HAS_ACL
-
-        self._process = None
+        self._cap = None
+        self._started = False
         self._width = 0
         self._height = 0
         self._fps = 25.0
-        self._started = False
         self._frame_count = 0
-        self._frame_size = 0
-        self._first_frame = None
 
-        # VPC 资源（懒初始化）
-        self._vpc_stream = None
-        self._vpc_desc = None
-        self._vpc_inited = False
-
-        # VPC 缓存 device buffer + pic_desc
-        self._dev_nv12 = None
-        self._dev_nv12_size = 0
-        self._nv12_desc = None
-
-        self._dev_bgr = None
-        self._dev_bgr_size = 0
-        self._bgr_desc = None
-        self._bgr_w_stride = 0
-
-        self._dev_bgr_rsz = None
-        self._dev_bgr_rsz_size = 0
-        self._bgr_rsz_desc = None
-        self._bgr_rsz_w_stride = 0
-
-        self._resize_cfg = None
-        self._roi = None
-
-        # 缓存尺寸标记
-        self._cached_nv12_w = 0
-        self._cached_nv12_h = 0
-        self._cached_bgr_w = 0
-        self._cached_bgr_h = 0
-        self._cached_rsz_w = 0
-        self._cached_rsz_h = 0
-
-    # ==================== VPC 内部方法 ====================
-
-    def _vpc_init(self):
-        """初始化 VPC 通道和 stream"""
-        if self._vpc_inited:
-            return True
-        try:
-            acl.rt.set_device(self.device_id)
-            self._vpc_stream, ret = acl.rt.create_stream()
-            if ret != 0:
-                print(f"[VPC] create_stream failed: ret={ret}")
-                return False
-            self._vpc_desc = acl.media.dvpp_create_channel_desc()
-            ret = acl.media.dvpp_create_channel(self._vpc_desc)
-            if ret != 0:
-                print(f"[VPC] create_channel failed: ret={ret}")
-                return False
-            self._vpc_inited = True
-            print(f"[VPC] 初始化成功 (device={self.device_id})")
-            return True
-        except Exception as e:
-            print(f"[VPC] 初始化异常: {e}")
+    def start(self):
+        import cv2
+        self._cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        if not self._cap.isOpened():
+            self._cap.release()
+            self._cap = None
             return False
-
-    def _vpc_ensure_nv12(self, width, height):
-        """确保 NV12 device buffer 就绪"""
-        if self._cached_nv12_w == width and self._cached_nv12_h == height:
-            return True
-        w_stride = _align_up(width, 16)
-        h_stride = _align_up(height, 2)
-        size = w_stride * h_stride * 3 // 2
-
-        if self._dev_nv12 is not None:
-            acl.media.dvpp_free(self._dev_nv12)
-        if self._nv12_desc is not None:
-            acl.media.dvpp_destroy_pic_desc(self._nv12_desc)
-
-        self._dev_nv12, ret = acl.media.dvpp_malloc(size)
-        if ret != 0:
-            return False
-
-        self._nv12_desc = acl.media.dvpp_create_pic_desc()
-        acl.media.dvpp_set_pic_desc_data(self._nv12_desc, self._dev_nv12)
-        acl.media.dvpp_set_pic_desc_format(self._nv12_desc, FMT_NV12)
-        acl.media.dvpp_set_pic_desc_width(self._nv12_desc, width)
-        acl.media.dvpp_set_pic_desc_height(self._nv12_desc, height)
-        acl.media.dvpp_set_pic_desc_width_stride(self._nv12_desc, w_stride)
-        acl.media.dvpp_set_pic_desc_height_stride(self._nv12_desc, h_stride)
-        acl.media.dvpp_set_pic_desc_size(self._nv12_desc, size)
-
-        self._dev_nv12_size = size
-        self._cached_nv12_w = width
-        self._cached_nv12_h = height
-        return True
-
-    def _vpc_ensure_bgr(self, width, height):
-        """确保 BGR device buffer 就绪"""
-        if self._cached_bgr_w == width and self._cached_bgr_h == height:
-            return True
-        w_stride = _align_up(width, 16) * 3
-        h_stride = _align_up(height, 2)
-        size = w_stride * h_stride
-
-        if self._dev_bgr is not None:
-            acl.media.dvpp_free(self._dev_bgr)
-        if self._bgr_desc is not None:
-            acl.media.dvpp_destroy_pic_desc(self._bgr_desc)
-
-        self._dev_bgr, ret = acl.media.dvpp_malloc(size)
-        if ret != 0:
-            return False
-
-        self._bgr_desc = acl.media.dvpp_create_pic_desc()
-        acl.media.dvpp_set_pic_desc_data(self._bgr_desc, self._dev_bgr)
-        acl.media.dvpp_set_pic_desc_format(self._bgr_desc, FMT_BGR)
-        acl.media.dvpp_set_pic_desc_width(self._bgr_desc, width)
-        acl.media.dvpp_set_pic_desc_height(self._bgr_desc, height)
-        acl.media.dvpp_set_pic_desc_width_stride(self._bgr_desc, w_stride)
-        acl.media.dvpp_set_pic_desc_height_stride(self._bgr_desc, h_stride)
-        acl.media.dvpp_set_pic_desc_size(self._bgr_desc, size)
-
-        self._dev_bgr_size = size
-        self._bgr_w_stride = w_stride
-        self._cached_bgr_w = width
-        self._cached_bgr_h = height
-        return True
-
-    def _vpc_ensure_bgr_rsz(self, dst_w, dst_h):
-        """确保 BGR resize 输出 device buffer 就绪"""
-        if self._cached_rsz_w == dst_w and self._cached_rsz_h == dst_h:
-            return True
-        w_stride = _align_up(dst_w, 16) * 3
-        h_stride = _align_up(dst_h, 2)
-        size = w_stride * h_stride
-
-        if self._dev_bgr_rsz is not None:
-            acl.media.dvpp_free(self._dev_bgr_rsz)
-        if self._bgr_rsz_desc is not None:
-            acl.media.dvpp_destroy_pic_desc(self._bgr_rsz_desc)
-
-        self._dev_bgr_rsz, ret = acl.media.dvpp_malloc(size)
-        if ret != 0:
-            return False
-
-        self._bgr_rsz_desc = acl.media.dvpp_create_pic_desc()
-        acl.media.dvpp_set_pic_desc_data(self._bgr_rsz_desc, self._dev_bgr_rsz)
-        acl.media.dvpp_set_pic_desc_format(self._bgr_rsz_desc, FMT_BGR)
-        acl.media.dvpp_set_pic_desc_width(self._bgr_rsz_desc, dst_w)
-        acl.media.dvpp_set_pic_desc_height(self._bgr_rsz_desc, dst_h)
-        acl.media.dvpp_set_pic_desc_width_stride(self._bgr_rsz_desc, w_stride)
-        acl.media.dvpp_set_pic_desc_height_stride(self._bgr_rsz_desc, h_stride)
-        acl.media.dvpp_set_pic_desc_size(self._bgr_rsz_desc, size)
-
-        self._dev_bgr_rsz_size = size
-        self._bgr_rsz_w_stride = w_stride
-        self._cached_rsz_w = dst_w
-        self._cached_rsz_h = dst_h
-        return True
-
-    def _vpc_upload_nv12(self, nv12_data, width, height):
-        """NV12 host 数据上传到 device buffer"""
-        if isinstance(nv12_data, bytes):
-            nv12_np = np.frombuffer(nv12_data, dtype=np.uint8)
-        else:
-            nv12_np = nv12_data
-
-        raw_size = width * height * 3 // 2
-        w_stride = _align_up(width, 16)
-        h_stride = _align_up(height, 2)
-        stride_size = w_stride * h_stride * 3 // 2
-
-        if stride_size == raw_size and len(nv12_np) == raw_size:
-            acl.rt.memcpy(int(self._dev_nv12), stride_size,
-                          int(nv12_np.ctypes.data), raw_size, ACL_H2D)
-        else:
-            # 向量化 stride 对齐，零 Python 循环
-            aligned = np.zeros(stride_size, dtype=np.uint8)
-            y_plane = nv12_np[:height * width].reshape(height, width)
-            uv_plane = nv12_np[height * width:].reshape(height // 2, width)
-            aligned[:height * w_stride].reshape(height, w_stride)[:, :width] = y_plane
-            uv_offset = h_stride * w_stride
-            aligned[uv_offset:uv_offset + (height // 2) * w_stride].reshape(height // 2, w_stride)[:, :width] = uv_plane
-            acl.rt.memcpy(int(self._dev_nv12), stride_size,
-                          int(aligned.ctypes.data), stride_size, ACL_H2D)
-
-    def _vpc_download_bgr(self, dev_bgr, width, height, bgr_size, w_stride):
-        """从 device 下载 BGR 数据到 host numpy（向量化，零 Python 循环）"""
-        buf = np.zeros(bgr_size, dtype=np.uint8)
-        acl.rt.memcpy(int(buf.ctypes.data), bgr_size, int(dev_bgr), bgr_size, ACL_D2H)
-        # reshape 利用 stride 对齐: w_stride = align_up(width, 16) * 3
-        # 切片 [:, :width, :] 去掉每行 padding
-        return buf[:height * w_stride].reshape(height, w_stride // 3, 3)[:, :width, :].copy()
-
-    def _vpc_nv12_to_bgr(self, nv12_data, width, height):
-        """VPC 硬件 NV12→BGR"""
-        if not self._vpc_init():
-            return None
-        if not self._vpc_ensure_nv12(width, height):
-            return None
-        if not self._vpc_ensure_bgr(width, height):
-            return None
-
-        self._vpc_upload_nv12(nv12_data, width, height)
-        acl.rt.memset(int(self._dev_bgr), self._dev_bgr_size, 0, self._dev_bgr_size)
-
-        ret = acl.media.dvpp_vpc_convert_color_async(
-            self._vpc_desc, self._nv12_desc, self._bgr_desc, self._vpc_stream)
-        if ret != 0:
-            return None
-        acl.rt.synchronize_stream(self._vpc_stream)
-        return self._vpc_download_bgr(self._dev_bgr, width, height,
-                                       self._dev_bgr_size, self._bgr_w_stride)
-
-    def _vpc_nv12_to_bgr_resized(self, nv12_data, src_w, src_h, dst_w, dst_h):
-        """VPC 硬件 NV12→BGR + resize 一步完成"""
-        if not self._vpc_init():
-            return None
-        if not self._vpc_ensure_nv12(src_w, src_h):
-            return None
-        if not self._vpc_ensure_bgr_rsz(dst_w, dst_h):
-            return None
-
-        self._vpc_upload_nv12(nv12_data, src_w, src_h)
-        acl.rt.memset(int(self._dev_bgr_rsz), self._dev_bgr_rsz_size, 0, self._dev_bgr_rsz_size)
-
-        if self._roi is not None:
-            acl.media.dvpp_destroy_roi_config(self._roi)
-        self._roi = acl.media.dvpp_create_roi_config(0, src_w - 1, 0, src_h - 1)
-
-        if self._resize_cfg is None:
-            self._resize_cfg = acl.media.dvpp_create_resize_config()
-            acl.media.dvpp_set_resize_config_interpolation(self._resize_cfg, 0)
-
-        ret = acl.media.dvpp_vpc_crop_resize_async(
-            self._vpc_desc, self._nv12_desc, self._bgr_rsz_desc,
-            self._roi, self._resize_cfg, self._vpc_stream)
-        if ret != 0:
-            return None
-        acl.rt.synchronize_stream(self._vpc_stream)
-        return self._vpc_download_bgr(self._dev_bgr_rsz, dst_w, dst_h,
-                                       self._dev_bgr_rsz_size, self._bgr_rsz_w_stride)
-
-    def _vpc_cleanup(self):
-        """释放 VPC 资源"""
-        if not self._vpc_inited:
-            return
-        for desc in (self._nv12_desc, self._bgr_desc, self._bgr_rsz_desc):
-            if desc is not None:
-                acl.media.dvpp_destroy_pic_desc(desc)
-        for dev in (self._dev_nv12, self._dev_bgr, self._dev_bgr_rsz):
-            if dev is not None:
-                acl.media.dvpp_free(dev)
-        if self._resize_cfg is not None:
-            acl.media.dvpp_destroy_resize_config(self._resize_cfg)
-        if self._roi is not None:
-            acl.media.dvpp_destroy_roi_config(self._roi)
-        if self._vpc_desc is not None:
-            acl.media.dvpp_destroy_channel(self._vpc_desc)
-        if self._vpc_stream is not None:
-            acl.rt.destroy_stream(self._vpc_stream)
-
-        self._vpc_inited = False
-        self._vpc_stream = None
-        self._vpc_desc = None
-        self._dev_nv12 = None
-        self._dev_bgr = None
-        self._dev_bgr_rsz = None
-        self._nv12_desc = None
-        self._bgr_desc = None
-        self._bgr_rsz_desc = None
-        self._resize_cfg = None
-        self._roi = None
-        self._cached_nv12_w = 0
-        self._cached_nv12_h = 0
-        self._cached_bgr_w = 0
-        self._cached_bgr_h = 0
-        self._cached_rsz_w = 0
-        self._cached_rsz_h = 0
-
-    # ==================== VDEC 方法 ====================
-
-    def start(self) -> bool:
-        """启动 ffmpeg 硬解码管道"""
-        if self._started:
-            return True
-
-        # Step 1: 探测视频信息
-        print(f"[Ascend-FFmpeg] 探测视频源: {self.rtsp_url}")
-        info = _probe_video_info(self.rtsp_url)
-
-        if info:
-            self._width = info['width']
-            self._height = info['height']
-            self._fps = info['fps']
-
-            if self._auto_detect_codec:
-                detected = CODEC_NAME_TO_EN_TYPE.get(info['codec_name'])
-                if detected and detected != self._en_type:
-                    print(f"[Ascend-FFmpeg] 自动检测编码: {info['codec_name']} → {detected} (配置: {self._en_type})")
-                    self._en_type = detected
-                AscendFFmpegDecoder._detected_codec_cache[self.rtsp_url] = self._en_type
-            print(f"[Ascend-FFmpeg] 视频信息: {self._width}x{self._height} @ {self._fps:.1f}fps, codec={info.get('codec_name', 'unknown')}")
-        else:
-            cached_en_type = AscendFFmpegDecoder._detected_codec_cache.get(self.rtsp_url)
-            if cached_en_type:
-                print(f"[Ascend-FFmpeg] ffprobe 失败，使用缓存的编码: {cached_en_type}")
-                self._en_type = cached_en_type
-            else:
-                print("[Ascend-FFmpeg] ffprobe 失败，使用配置默认值")
-            self._width = 1920
-            self._height = 1080
-            self._fps = 25.0
-
-        # Step 2: NV12 帧大小
-        self._frame_size = self._width * self._height * 3 // 2
-
-        # Step 3: 确定 channel_id
-        if self._channel_id is not None:
-            ch_id = self._channel_id
-        else:
-            ch_id = _allocate_channel_id()
-            self._allocated_channel = ch_id
-        print(f"[Ascend-FFmpeg] VDEC channel_id={ch_id}"
-              f"{' (自动分配)' if self._allocated_channel is not None else ''}")
-
-        # Step 4: 检查解码器可用性
-        ascend_codec = CODEC_MAP.get(self._en_type, "h264_ascend")
-        if not _check_decoder_available(ascend_codec):
-            print(f"[Ascend-FFmpeg] 解码器 '{ascend_codec}' 不可用，硬解码不支持 {self._en_type}")
-            return False
-
-        # Step 5: 构建 ffmpeg 命令（固定 NV12 输出）
-        cmd = [_get_ffmpeg_bin()]
-
-        if self.rtsp_url.startswith('rtsp://'):
-            cmd.extend([
-                '-rtsp_transport', 'tcp',
-                '-stimeout', '5000000',
-                '-fflags', '+genpts+discardcorrupt',
-            ])
-
-        cmd.extend([
-            '-hwaccel', 'ascend',
-            '-c:v', ascend_codec,
-            '-device_id', str(self.device_id),
-            '-channel_id', str(ch_id),
-        ])
-
-        cmd.append('-i')
-        cmd.append(self.rtsp_url)
-
-        cmd.extend([
-            '-f', 'rawvideo',
-            '-pix_fmt', 'nv12',
-            '-loglevel', 'error',
-            'pipe:1'
-        ])
-
-        vpc_label = "VPC硬件转换" if self._use_vpc else "CPU转换"
-        print(f"[Ascend-FFmpeg] 启动硬解码管道: {ascend_codec}, pix_fmt=nv12, {vpc_label}")
-
-        # Step 6: 启动 ffmpeg 子进程
-        env = os.environ.copy()
-        ffmpeg_dir = _find_ffmpeg()
-        if ffmpeg_dir:
-            lib_dir = os.path.join(os.path.dirname(ffmpeg_dir), 'lib')
-            if os.path.isdir(lib_dir):
-                env['LD_LIBRARY_PATH'] = lib_dir + ':' + env.get('LD_LIBRARY_PATH', '')
-            env['PATH'] = ffmpeg_dir + ':' + env.get('PATH', '')
-
-        try:
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=self._frame_size * 2,
-                env=env,
-            )
-        except FileNotFoundError:
-            print("[Ascend-FFmpeg] ffmpeg 未安装!")
-            return False
-        except Exception as e:
-            print(f"[Ascend-FFmpeg] 启动 ffmpeg 失败: {e}")
-            return False
-
-        # Step 7: 等待 ffmpeg 初始化并读取首帧验证
-        import time as _time
-        _time.sleep(0.5)
-
-        if self._process.poll() is not None:
-            stderr_output = ""
-            try:
-                stderr_output = self._process.stderr.read().decode('utf-8', errors='replace')
-            except:
-                pass
-            print(f"[Ascend-FFmpeg] ffmpeg 启动后立即退出 (ret={self._process.returncode})")
-            if stderr_output:
-                print(f"[Ascend-FFmpeg] stderr: {stderr_output[:500]}")
-            self._process = None
-            return False
-
-        try:
-            first_frame_data = self._process.stdout.read(self._frame_size)
-            if len(first_frame_data) != self._frame_size:
-                stderr_output = ""
-                try:
-                    stderr_output = self._process.stderr.read().decode('utf-8', errors='replace')
-                except:
-                    pass
-                print(f"[Ascend-FFmpeg] 首帧读取失败 (got {len(first_frame_data)}/{self._frame_size} bytes)")
-                if stderr_output:
-                    print(f"[Ascend-FFmpeg] ffmpeg stderr: {stderr_output[:500]}")
-                self._process.kill()
-                self._process.wait(timeout=3)
-                self._process = None
-                return False
-
-            self._first_frame = first_frame_data
-        except Exception as e:
-            print(f"[Ascend-FFmpeg] 首帧读取异常: {e}")
-            try:
-                self._process.kill()
-                self._process.wait(timeout=3)
-            except:
-                pass
-            self._process = None
-            return False
-
+        self._width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 25.0
         self._started = True
-        print(f"[Ascend-FFmpeg] 硬解码管道就绪: {self._width}x{self._height} @ {self._fps:.1f}fps, "
-              f"编码={self._en_type}, 色彩转换={vpc_label}")
+        print(f"[Cv2Decoder] CPU 软解码启动: {self._width}x{self._height} @ {self._fps:.1f}fps")
         return True
-
-    def _read_raw_nv12(self):
-        """读取一帧 NV12 raw bytes（内部用）"""
-        if not self._started:
-            return None
-
-        if self._first_frame is not None:
-            raw = self._first_frame
-            self._first_frame = None
-        else:
-            try:
-                raw = self._process.stdout.read(self._frame_size)
-            except Exception:
-                return None
-
-            if len(raw) != self._frame_size:
-                return None
-
-        self._frame_count += 1
-        return raw
 
     def read_frame(self):
-        """读取一帧 BGR 图像
-
-        use_vpc=True: VPC 硬件 NV12→BGR（零 CPU 色彩转换）
-        use_vpc=False: CPU cv2.cvtColor NV12→BGR
-        返回 BGR numpy (H, W, 3)，或 None
-        """
-        raw = self._read_raw_nv12()
-        if raw is None:
+        import cv2
+        if not self._started or self._cap is None:
             return None
-
-        if self._use_vpc:
-            bgr = self._vpc_nv12_to_bgr(raw, self._width, self._height)
-            if bgr is not None:
-                return bgr
-            # VPC 失败，回退 CPU
-            if self._frame_count <= 2:
-                print("[Ascend-FFmpeg] VPC 转换失败，回退 CPU")
-            self._use_vpc = False
-            self._vpc_cleanup()
-
-        return _nv12_to_bgr_cpu(raw, self._width, self._height)
-
-    def read_frame_bgr(self):
-        """读取一帧 BGR 图像（兼容旧接口，等同 read_frame()）"""
-        return self.read_frame()
+        ret, frame = self._cap.read()
+        if not ret or frame is None:
+            return None
+        self._frame_count += 1
+        return frame
 
     def read_frame_resized(self, dst_w, dst_h):
-        """读取一帧 BGR 图像并 resize（VPC 一步完成 NV12→BGR+resize）
-
-        仅 use_vpc=True 时有效，否则回退 read_frame() + CPU resize。
-        返回 BGR numpy (dst_h, dst_w, 3)，或 None
-        """
-        raw = self._read_raw_nv12()
-        if raw is None:
-            return None
-
-        if self._use_vpc:
-            bgr = self._vpc_nv12_to_bgr_resized(raw, self._width, self._height, dst_w, dst_h)
-            if bgr is not None:
-                return bgr
-            if self._frame_count <= 2:
-                print("[Ascend-FFmpeg] VPC crop_resize 失败，回退 CPU")
-            self._use_vpc = False
-            self._vpc_cleanup()
-
-        # CPU 回退
         import cv2
-        bgr = _nv12_to_bgr_cpu(raw, self._width, self._height)
-        return cv2.resize(bgr, (dst_w, dst_h))
-
-    def read_frame_nv12(self):
-        """读取一帧 NV12 原始数据（跳过色彩转换）
-
-        返回 dict: {'data': bytes, 'width': int, 'height': int, 'format': 'nv12'}
-        或 None
-        """
-        raw = self._read_raw_nv12()
-        if raw is None:
+        frame = self.read_frame()
+        if frame is None:
             return None
-        return {'data': raw, 'width': self._width, 'height': self._height, 'format': 'nv12'}
+        return cv2.resize(frame, (dst_w, dst_h))
 
     def release(self):
-        """释放所有资源（VPC + VDEC）"""
         self._started = False
-        self._vpc_cleanup()
-        if self._process:
-            try:
-                self._process.stdout.close()
-                self._process.stderr.close()
-                self._process.kill()
-                self._process.wait(timeout=3)
-            except Exception:
-                pass
-            self._process = None
-        if self._allocated_channel is not None:
-            _release_channel_id(self._allocated_channel)
-            self._allocated_channel = None
-        self._first_frame = None
-        print(f"[Ascend-FFmpeg] 资源已释放 (解码帧数: {self._frame_count}, VPC={'已用' if not self._use_vpc or self._vpc_inited else '未用'})")
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        print(f"[Cv2Decoder] 资源已释放 (解码帧数: {self._frame_count})")
 
     @property
     def width(self):
@@ -837,7 +336,17 @@ class AscendFFmpegDecoder(BaseVideoDecoder):
 
     @property
     def is_started(self):
-        return self._started and self._process is not None
+        return self._started
+
+    @property
+    def is_recording(self):
+        return False
+
+    def start_record(self, save_path):
+        print("[Cv2Decoder] 不支持码流录制")
+
+    def stop_record(self):
+        return ""
 
 
 # ==================== acl 原生 VDEC + VPC 解码器 ====================
@@ -872,6 +381,143 @@ def _get_h265_nal_type(data):
     elif data[:3] == b"\x00\x00\x01":
         return (data[3] >> 1) & 0x3F
     return -1
+
+
+class PyAvStreamRecorder:
+    """PyAV 原始码流remux录制，修复av.Fraction不存在、参数警告、22报错"""
+
+    def __init__(self, seg_sec=300):
+        self._seg_sec = seg_sec
+        self._save_dir = ""
+        self._base_name = ""
+        self._out_container = None
+        self._out_stream = None
+        self._start_ts = None
+        self._seq = 0
+        self._recording = False
+        self._pkt_count = 0
+        self._current_path = ""
+        self._lock = threading.Lock()
+
+    def start_record(self, save_path):
+        """启动录制，传入最终MP4完整路径"""
+        self.stop_record()
+        self._save_dir = os.path.dirname(os.path.abspath(save_path))
+        self._base_name = os.path.splitext(os.path.basename(save_path))[0]
+        os.makedirs(self._save_dir, exist_ok=True)
+        self._recording = True
+        self._pkt_count = 0
+        self._seq = 0
+        self._new_segment()
+        print(f"[PyAvRec] 录制启动 分片{self._seg_sec}s | 目录:{self._save_dir}")
+
+    def _new_segment(self):
+        """新建分片MP4，移除无效vcodec参数"""
+        self._close_segment()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(self._save_dir, f"{self._base_name}_{self._seq}_{ts}.mp4")
+        self._current_path = fname
+        self._seq += 1
+        try:
+            # 只保留容器合法参数，删除vcodec（会报未使用警告）
+            self._out_container = _av.open(
+                fname,
+                mode="w",
+                format="mp4",
+                options={
+                    "movflags": "+faststart+empty_moov",
+                    "strict": "-2"
+                }
+            )
+            self._out_stream = None
+            self._start_ts = time.time()
+        except Exception as e:
+            print(f"[PyAvRec] 创建分片失败: {e}")
+            self._out_container = None
+
+    def _close_segment(self):
+        """关闭当前分片，刷新缓存"""
+        if self._out_container is not None:
+            try:
+                self._out_container.close()
+            except Exception:
+                pass
+            self._out_container = None
+            self._out_stream = None
+
+    def write_packet(self, pkt):
+        """写入码流包：移除av.Fraction强制赋值，兼容旧版PyAV"""
+        if not self._recording or self._out_container is None or pkt.size <= 0:
+            return
+        with self._lock:
+            # 分片超时切换文件
+            if time.time() - self._start_ts > self._seg_sec:
+                self._new_segment()
+                return
+            # 首包创建输出流（add_stream_from_template 拷贝全部编码参数，remux 零编码）
+            if self._out_stream is None:
+                try:
+                    self._out_stream = self._out_container.add_stream_from_template(pkt.stream)
+                    print(f"[PyAvRec] 输出流创建(remux) {pkt.stream.width}x{pkt.stream.height}")
+                except Exception as e:
+                    print(f"[PyAvRec] 创建输出流失败: {e}")
+                    return
+            # 直接复用packet原生time_base，不再手动覆盖Fraction
+            pkt.stream = self._out_stream
+            try:
+                self._out_container.mux(pkt)
+                self._pkt_count += 1
+            except Exception as e:
+                if self._pkt_count <= 5:
+                    print(f"[PyAvRec] write_packet 异常: {e}")
+
+    def stop_record(self):
+        """停止录制，自动合并所有分片为单个MP4，清理碎片"""
+        with self._lock:
+            self._recording = False
+            self._close_segment()
+        # 匹配所有分片文件
+        seg_pattern = os.path.join(self._save_dir, f"{self._base_name}_*.mp4")
+        seg_list = sorted(glob.glob(seg_pattern))
+        target_mp4 = os.path.join(self._save_dir, f"{self._base_name}.mp4")
+        if not seg_list:
+            print(f"[PyAvRec] 无录制分片")
+            self._current_path = ""
+            return ""
+        # 生成concat列表
+        list_file = os.path.join(self._save_dir, "concat_tmp.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for file in seg_list:
+                f.write(f"file '{file}'\n")
+        # 纯拷贝合并，无软编码
+        merge_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", list_file, "-c", "copy", target_mp4
+        ]
+        try:
+            subprocess.run(merge_cmd, capture_output=True, timeout=600)
+            # 合并成功删除分片与临时清单
+            for seg in seg_list:
+                os.remove(seg)
+            os.remove(list_file)
+            self._current_path = target_mp4
+            print(f"[PyAvRec] 录制停止，自动合并完成，总包数:{self._pkt_count} 视频:{target_mp4}")
+        except Exception as e:
+            print(f"[PyAvRec] 分片合并失败，保留分段文件: {e}")
+            self._current_path = seg_list[-1]
+        return self._current_path
+
+    @property
+    def recording(self):
+        return self._recording
+
+    @property
+    def current_path(self):
+        return self._current_path
+
+    @property
+    def packet_count(self):
+        return self._pkt_count
 
 
 class AclVdecDecoder(BaseVideoDecoder):
@@ -942,6 +588,11 @@ class AclVdecDecoder(BaseVideoDecoder):
         self._frame_queue = queue.Queue(maxsize=4)
         # 延迟销毁队列（回调存入 desc，主线程 destroy，避免回调线程 double free）
         self._desc_queue = queue.Queue(maxsize=64)
+
+        # PyAV 原始码流录制（零 CPU 编码，直接 mux 原始 H264/H265 到 MP4）
+        self._stream_recorder = None
+        self._recording = False
+        self._record_save_path = ""
 
     # ==================== VDEC 回调 ====================
 
@@ -1242,9 +893,12 @@ class AclVdecDecoder(BaseVideoDecoder):
         return True
 
     def _demux_loop(self):
-        """demux 线程主循环：PyAV demux → NAL 队列
+        """demux 线程主循环：PyAV demux → NAL 队列 + 录制分流
 
         此线程独占 PyAV container，不与其他线程共享。
+        Packet 同时分流两路：
+          1. 录制：原始码流直接 mux 写入 MP4（零 CPU 编码）
+          2. 推理：bytes(packet) 送 NAL 队列 → VDEC 解码
         """
         container = None
         try:
@@ -1252,9 +906,17 @@ class AclVdecDecoder(BaseVideoDecoder):
                 'rtsp_transport': 'tcp', 'stimeout': '5000000'})
             video_stream = container.streams.video[0]
 
+            # 保存 video_stream 模板供录制器使用
+            self._video_stream = video_stream
+
             for packet in container.demux([video_stream]):
                 if not self._demux_running:
                     break
+                # 第一路：原始码流直接 mux 写入 MP4（零 CPU 编码）
+                if self._recording and self._stream_recorder is not None:
+                    if packet.dts is not None and packet.size > 0:
+                        self._stream_recorder.write_packet(packet)
+                # 第二路：NAL 包送队列 → VDEC 解码
                 nal = bytes(packet)
                 if len(nal) == 0:
                     continue
@@ -1289,6 +951,41 @@ class AclVdecDecoder(BaseVideoDecoder):
                 self._nal_queue.get_nowait()
             except queue.Empty:
                 break
+
+    def _reconnect_demux(self):
+        """demux 线程断开后自动重连 RTSP"""
+        now = time.time()
+        # 限频：30 秒内不重复重连
+        if now - getattr(self, '_last_reconnect_ts', 0) < 30:
+            return False
+        self._last_reconnect_ts = now
+
+        print(f"[AclVdec] demux 线程已断开，尝试重连 RTSP...")
+        self._stop_demux()
+        # 清空帧队列
+        while not self._frame_queue.empty():
+            try:
+                info = self._frame_queue.get_nowait()
+                if isinstance(info, dict) and info.get("buffer"):
+                    acl.media.dvpp_free(info["buffer"])
+            except queue.Empty:
+                break
+        self._vdec_cb_count = 0
+        self._flush_desc_queue()
+        # 重新启动 demux 线程
+        self._demux_running = True
+        self._demux_thread = threading.Thread(target=self._demux_loop, daemon=True)
+        self._demux_thread.start()
+        # 等待首批 NAL 包
+        for _ in range(30):
+            if not self._nal_queue.empty():
+                print(f"[AclVdec] RTSP 重连成功")
+                return True
+            if not self._demux_running:
+                break
+            time.sleep(0.1)
+        print(f"[AclVdec] RTSP 重连失败，等待下次重试")
+        return False
 
     # ==================== 帧读取 ====================
 
@@ -1477,6 +1174,11 @@ class AclVdecDecoder(BaseVideoDecoder):
         if not self._started:
             return None
 
+        # demux 线程已死 → 自动重连
+        if not self._demux_running:
+            if not self._reconnect_demux():
+                return None
+
         # 调用方需确保当前线程有正确的 ACL context
         # 使用 set_context 切换到 DVPP 的 context（VPC 操作需要）
         # 调用方在推理前需恢复自己的 context
@@ -1519,6 +1221,11 @@ class AclVdecDecoder(BaseVideoDecoder):
         if not self._started:
             return None
 
+        # demux 线程已死 → 自动重连
+        if not self._demux_running:
+            if not self._reconnect_demux():
+                return None
+
         if self._ctx is not None:
             acl.rt.set_context(self._ctx)
         else:
@@ -1547,9 +1254,59 @@ class AclVdecDecoder(BaseVideoDecoder):
             'vdec_buffer': frame_info["buffer"],  # 主线程用完 dvpp_free
         }
 
+    # ==================== PyAV 原始码流录制 ====================
+
+    def start_record(self, save_path):
+        """启动 PyAV 原始码流录制（零 CPU 编码，直接 mux 原始 H264/H265 到 MP4）
+
+        Args:
+            save_path: 最终 MP4 文件路径（如 /xxx/record.mp4）
+        """
+        if self._recording:
+            print("[PyAvRec] 录制已在运行")
+            return
+        if not self._started:
+            print("[PyAvRec] 解码器未启动，无法录制")
+            return
+        if self._stream_recorder is None:
+            self._stream_recorder = PyAvStreamRecorder(seg_sec=300)
+        self._stream_recorder.start_record(save_path)
+        self._recording = True
+        self._record_save_path = save_path
+        print(f"[AclVdec] 开始码流录制: {save_path}")
+
+    def stop_record(self):
+        """停止码流录制，返回 MP4 路径"""
+        if not self._recording or self._stream_recorder is None:
+            return ""
+        self._recording = False
+        mp4_path = self._stream_recorder.stop_record()
+        self._record_save_path = mp4_path
+        print(f"[AclVdec] 停止录制: {mp4_path}")
+        return mp4_path
+
+    @property
+    def is_recording(self):
+        """录制状态"""
+        return self._recording
+
+    @property
+    def record_save_path(self):
+        """当前录制文件路径"""
+        if self._stream_recorder is not None:
+            return self._stream_recorder.current_path or self._record_save_path
+        return self._record_save_path
+
     def release(self):
         """释放所有资源"""
         self._started = False
+
+        # 停止码流录制
+        if self._recording:
+            self.stop_record()
+        if self._stream_recorder is not None:
+            self._stream_recorder.stop_record()
+            self._stream_recorder = None
 
         # 先停 demux 线程，不再有新 NAL 数据
         self._stop_demux()
@@ -1655,7 +1412,7 @@ class AclVdecDecoder(BaseVideoDecoder):
 def create_dvpp_decoder(rtsp_url, device_id=0, channel_id=None, en_type="H264",
                          auto_detect_codec=True, use_vpc=True):
     """
-    创建硬解码器（优先 acl 原生 VDEC，回退 Ascend-FFmpeg）
+    创建解码器（优先 acl 原生 VDEC，回退 CPU 软解码）
 
     Args:
         channel_id: VDEC 通道 ID。None=自动分配，int=指定通道。
@@ -1664,8 +1421,13 @@ def create_dvpp_decoder(rtsp_url, device_id=0, channel_id=None, en_type="H264",
                  False=CPU cv2.cvtColor 转换
 
     Returns:
-        AclVdecDecoder 或 AscendFFmpegDecoder 实例，或 None（启动失败）
+        AclVdecDecoder 或 Cv2Decoder 实例
+
+    Raises:
+        RuntimeError: 所有解码器启动失败，附带失败原因
     """
+    errors = []
+
     # 优先 acl 原生 VDEC（全 NPU 链路，零 CPU 图像搬运）
     if _HAS_ACL and _HAS_PYAV:
         try:
@@ -1678,20 +1440,23 @@ def create_dvpp_decoder(rtsp_url, device_id=0, channel_id=None, en_type="H264",
             )
             if decoder.start():
                 return decoder
-            print("[create_dvpp_decoder] AclVdecDecoder 启动失败，回退 Ascend-FFmpeg")
+            errors.append("AclVdecDecoder start() returned False")
             decoder.release()
         except Exception as e:
-            print(f"[create_dvpp_decoder] AclVdecDecoder 异常: {e}，回退 Ascend-FFmpeg")
+            errors.append(f"AclVdecDecoder 异常: {e}")
+    elif not _HAS_ACL:
+        errors.append("acl 模块不可用")
+    elif not _HAS_PYAV:
+        errors.append("PyAV(av) 模块不可用")
 
-    # 回退 Ascend-FFmpeg
-    decoder = AscendFFmpegDecoder(
-        rtsp_url=rtsp_url,
-        device_id=device_id,
-        channel_id=channel_id,
-        en_type=en_type,
-        auto_detect_codec=auto_detect_codec,
-        use_vpc=use_vpc,
-    )
-    if decoder.start():
-        return decoder
-    return None
+    # 回退 CPU 软解码（OpenCV）
+    try:
+        decoder = Cv2Decoder(rtsp_url=rtsp_url)
+        if decoder.start():
+            print(f"[create_dvpp_decoder] 回退 CPU 软解码: {rtsp_url}")
+            return decoder
+        errors.append("Cv2Decoder start() returned False")
+    except Exception as e:
+        errors.append(f"Cv2Decoder 异常: {e}")
+
+    raise RuntimeError("; ".join(errors))

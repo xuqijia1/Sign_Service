@@ -8,7 +8,6 @@ from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any
 
 from SharedData import shared_data, DetectionBox, SignResult, get_sign_type
-from VideoStream import JpegFrameRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +126,13 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_error_response('缺少userid参数')
             return
 
-        # 停止之前的录制
+        # 停止之前的码流录制
         vs = shared_data.video_recorder
-        if vs and vs.video_recorder is not None:
-            vs.video_recorder.release()
-            vs.video_recorder = None
+        if vs and vs.dvpp_decoder is not None and vs.dvpp_decoder.is_recording:
+            try:
+                vs.dvpp_decoder.stop_record()
+            except Exception as e:
+                logger.warning(f"停止码流录制异常: {e}")
 
         # 设置用户ID
         shared_data.current_user_id = userid
@@ -142,19 +143,22 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         shared_data.latest_result = None
         shared_data.frame_count = 0
 
-        # 创建录制器
+        # 启动码流录制
         video_path = ""
-        if vs is not None:
+        use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and
+                          hasattr(vs.dvpp_decoder, 'start_record'))
+        if use_stream_rec:
             date_str = datetime.now().strftime("%Y%m%d")
             time_str = datetime.now().strftime("%H%M%S")
             video_dir = os.path.join(vs._video_save_dir, date_str, userid)
             os.makedirs(video_dir, exist_ok=True)
             video_path = os.path.join(video_dir, f"sign_record_{userid}_{time_str}.mp4")
-            w = shared_data.frame_width if shared_data.frame_width > 0 else 1920
-            h = shared_data.frame_height if shared_data.frame_height > 0 else 1080
-            fps = shared_data.frame_fps if shared_data.frame_fps > 0 else 25.0
-            vs.video_recorder = JpegFrameRecorder(video_path, fps, w, h)
-            logger.info(f"录制器创建成功: {video_path} | {w}x{h} @ {fps:.1f}fps")
+            try:
+                vs.dvpp_decoder.start_record(video_path)
+                logger.info(f"PyAV 码流录制启动: {video_path}")
+            except Exception as e:
+                logger.warning(f"码流录制启动失败({e})")
+                video_path = ""
         shared_data.is_recording = True
 
         # 设置运行状态
@@ -177,10 +181,16 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         # 停止录制
         video_path = ""
         vs = shared_data.video_recorder
-        if vs and vs.video_recorder is not None:
-            video_path = vs.video_recorder.output_path
-            vs.video_recorder.release()
-            vs.video_recorder = None
+        use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and
+                          vs.dvpp_decoder.is_recording)
+        if use_stream_rec:
+            try:
+                rec_mp4 = vs.dvpp_decoder.stop_record()
+                if rec_mp4:
+                    video_path = rec_mp4
+                logger.info(f"码流录制停止: {video_path}")
+            except Exception as e:
+                logger.warning(f"码流录制停止异常: {e}")
 
         # 获取识别结果
         results = shared_data.get_all_results()
