@@ -143,6 +143,13 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         shared_data.latest_result = None
         shared_data.frame_count = 0
 
+        # DVPP 解码器软复位，清除之前断流脏状态
+        if vs is not None and vs.dvpp_decoder is not None:
+            try:
+                vs.dvpp_decoder.soft_reset()
+            except Exception as e:
+                logger.warning(f"解码器软复位异常: {e}")
+
         # 启动码流录制
         video_path = ""
         use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and

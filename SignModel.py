@@ -63,10 +63,15 @@ class SignModel:
             logger.error(f"推理引擎创建失败: {e}")
             raise
 
-    def detect(self, frame) -> List[dict]:
-        """执行检测"""
+    def detect(self, frame, orig_size=None) -> List[dict]:
+        """执行检测
+
+        Args:
+            frame: BGR 格式图片
+            orig_size: (orig_h, orig_w) 原始分辨率，DVPP 硬解时必须传入
+        """
         try:
-            return self.engine.infer(frame)
+            return self.engine.infer(frame, orig_size=orig_size)
         except Exception as e:
             logger.error(f"检测失败: {e}")
             return []

@@ -481,7 +481,6 @@ class PyAvStreamRecorder:
         seg_list = sorted(glob.glob(seg_pattern))
         target_mp4 = os.path.join(self._save_dir, f"{self._base_name}.mp4")
         if not seg_list:
-            print(f"[PyAvRec] 无录制分片")
             self._current_path = ""
             return ""
         # 生成concat列表
@@ -629,6 +628,8 @@ class AclVdecDecoder(BaseVideoDecoder):
                         self._frame_queue.put_nowait({"buffer": pic_data, "size": pic_size})
                 else:
                     # 序列头空帧 / 解码失败 — 释放 device buffer
+                    if self._vdec_cb_count <= 20 or (self._vdec_cb_count % 100 == 0):
+                        print(f"[AclVdec] 回调丢弃帧: ret_code={ret_code} user_data={user_data} pic_data={'有' if pic_data else '无'} pic_size={pic_size}")
                     if pic_data is not None:
                         acl.media.dvpp_free(pic_data)
         except Exception as e:
@@ -1018,7 +1019,27 @@ class AclVdecDecoder(BaseVideoDecoder):
         # 等待首批 NAL 包（最多 5 秒）
         for _ in range(50):
             if not self._nal_queue.empty():
-                print(f"[AclVdec] RTSP 重连成功")
+                print(f"[AclVdec] RTSP 重连成功，清空帧缓存")
+                # 清空帧队列 + desc 队列（不调 soft_reset 避免递归停止 demux）
+                while not self._frame_queue.empty():
+                    try:
+                        info = self._frame_queue.get_nowait()
+                        if isinstance(info, dict) and info.get("buffer"):
+                            acl.media.dvpp_free(info["buffer"])
+                    except queue.Empty:
+                        break
+                self._flush_desc_queue()
+                while not self._desc_queue.empty():
+                    try:
+                        sd, pd = self._desc_queue.get_nowait()
+                        if sd is not None:
+                            acl.media.dvpp_destroy_stream_desc(sd)
+                        if pd is not None:
+                            acl.media.dvpp_destroy_pic_desc(pd)
+                    except queue.Empty:
+                        break
+                self._vdec_cb_count = 0
+                self._frame_count = 0
                 return True
             if not self._demux_running:
                 break
@@ -1296,6 +1317,58 @@ class AclVdecDecoder(BaseVideoDecoder):
             'height': self._target_h,
             'vdec_buffer': frame_info["buffer"],  # 主线程用完 dvpp_free
         }
+
+    # ==================== 软复位 ====================
+
+    def soft_reset(self):
+        """软复位解码状态（不销毁 VDEC/VPC 通道，多实例共享 device 安全）
+
+        清空 NAL/帧/desc 队列、释放残留 device buffer、
+        向 VDEC 发送 EOS 冲刷旧解码分片、重置内部计数。
+        同时断开 demux 线程，让 read_frame 下次走 _reconnect_demux 重连 RTSP。
+        """
+        # 1. 断开 demux 线程（让旧 PyAV 连接关闭，下次 read_frame 走重连路径）
+        self._stop_demux()
+
+        # 2. 清空解码输出帧队列，释放 device buffer
+        while not self._frame_queue.empty():
+            try:
+                info = self._frame_queue.get_nowait()
+                if isinstance(info, dict) and info.get("buffer"):
+                    acl.media.dvpp_free(info["buffer"])
+            except queue.Empty:
+                break
+
+        # 3. 销毁延迟 desc 队列残留
+        self._flush_desc_queue()
+        while not self._desc_queue.empty():
+            try:
+                sd, pd = self._desc_queue.get_nowait()
+                if sd is not None:
+                    acl.media.dvpp_destroy_stream_desc(sd)
+                if pd is not None:
+                    acl.media.dvpp_destroy_pic_desc(pd)
+            except queue.Empty:
+                break
+
+        # 4. 向 VDEC 发送 EOS 冲刷旧分片
+        try:
+            if self._vdec_ch_desc is not None and self._frame_cfg is not None:
+                acl.media.vdec_set_frame_config_eos(self._frame_cfg, 1)
+                sd = acl.media.dvpp_create_stream_desc()
+                acl.media.dvpp_set_stream_desc_data(sd, 0)
+                acl.media.dvpp_set_stream_desc_size(sd, 0)
+                acl.media.vdec_send_frame(self._vdec_ch_desc, sd, 0, self._frame_cfg, -999)
+                time.sleep(0.3)
+                acl.media.vdec_set_frame_config_eos(self._frame_cfg, 0)
+        except Exception:
+            pass
+
+        # 5. 重置内部计数标记
+        self._vdec_cb_count = 0
+        self._frame_count = 0
+
+        print(f"[AclVdec] 软复位完成，缓存全部清空")
 
     # ==================== PyAV 原始码流录制 ====================
 

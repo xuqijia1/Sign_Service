@@ -234,6 +234,7 @@ class VideoStream:
         self.cap: Optional[cv2.VideoCapture] = None
         self.dvpp_decoder = None
         self.use_dvpp = False
+        self.orig_size = None
         self.is_running = False
         self.thread: Optional[threading.Thread] = None
         self.frame_width = 1920
@@ -287,6 +288,7 @@ class VideoStream:
                 self.frame_width = self.dvpp_decoder.src_width or 1920
                 self.frame_height = self.dvpp_decoder.src_height or 1080
                 self.frame_fps = self.dvpp_decoder.fps or 25.0
+                self.orig_size = (self.dvpp_decoder.src_height, self.dvpp_decoder.src_width)
                 shared_data.frame_width = self.frame_width
                 shared_data.frame_height = self.frame_height
                 shared_data.frame_fps = self.frame_fps
@@ -296,10 +298,12 @@ class VideoStream:
                 logger.warning(f"DVPP 硬解码启动失败({e})，回退 cv2")
                 self.dvpp_decoder = None
                 self.use_dvpp = False
+                self.orig_size = None
             except Exception as e:
                 logger.warning(f"DVPP 硬解码启动异常({e})，回退 cv2")
                 self.dvpp_decoder = None
                 self.use_dvpp = False
+                self.orig_size = None
 
         # cv2 回退
         if not self.use_dvpp:
@@ -309,6 +313,8 @@ class VideoStream:
                 return
 
         self.is_running = True
+        self._consecutive_failures = 0
+        self._last_dvpp_warn_ts = 0
 
         # 启动处理线程
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
@@ -336,6 +342,7 @@ class VideoStream:
             self.dvpp_decoder.release()
             self.dvpp_decoder = None
             self.use_dvpp = False
+            self.orig_size = None
 
         if self.cap is not None:
             self.cap.release()
@@ -405,22 +412,26 @@ class VideoStream:
 
                 if self.use_dvpp and self.dvpp_decoder:
                     frame = self.dvpp_decoder.read_frame()
-                    # read_frame 切换了 ACL context 到 DVPP 的，
-                    # 推理前需恢复默认 context
                     if frame is not None:
                         try:
                             import acl
                             acl.rt.set_device(self.dvpp_decoder.device_id)
                         except Exception:
                             pass
-                    if frame is None:
-                        frame_count += 1
-                        if frame_count % 100 == 0:
-                            logger.warning("DVPP 读取帧失败")
+                        self._consecutive_failures = 0
+                        if frame_count < 5:
+                            logger.info(f"DVPP 读帧成功: shape={frame.shape}")
+                    else:
+                        self._consecutive_failures += 1
+                        if self._consecutive_failures > 10:
+                            now_ts = time.time()
+                            if now_ts - self._last_dvpp_warn_ts > 30:
+                                logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
+                                self._last_dvpp_warn_ts = now_ts
+                            self.dvpp_decoder.soft_reset()
+                            self._consecutive_failures = 0
                         time.sleep(0.05)
                         continue
-                    if frame_count < 5:
-                        logger.info(f"DVPP 读帧成功: shape={frame.shape}")
                 else:
                     if self.cap is None or not self.cap.isOpened():
                         logger.warning("视频源断开，尝试重连...")
@@ -449,7 +460,7 @@ class VideoStream:
 
                 # 执行检测
                 if shared_data.is_running:
-                    detections = self.model.detect(frame)
+                    detections = self.model.detect(frame, orig_size=self.orig_size)
 
                     # 转换为检测框列表
                     boxes = []

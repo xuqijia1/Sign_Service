@@ -155,12 +155,13 @@ class BaseInferenceEngine:
         self.names = names or load_class_names()
         self._infer_count = 0
 
-    def infer(self, image):
+    def infer(self, image, orig_size=None):
         """
         执行推理
 
         Args:
             image: BGR 格式图片 (numpy array)
+            orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
 
         Returns:
             list: 检测框列表，每个元素为字典:
@@ -183,13 +184,17 @@ class BaseInferenceEngine:
         """设置置信度阈值"""
         self.conf_threshold = conf_threshold
 
-    def _get_adaptive_recog_area(self, image_shape):
-        """获取自适应检测区域"""
-        h, w = image_shape[:2]
-        current_resolution = (w, h)
+    def _get_adaptive_recog_area(self, orig_size):
+        """获取自适应检测区域
+
+        Args:
+            orig_size: (orig_h, orig_w) 原始分辨率元组
+        """
+        orig_h, orig_w = orig_size
+        current_resolution = (orig_w, orig_h)
         if self.recog_area:
             return get_adaptive_recog_area(self.recog_area, self.CONFIG_RESOLUTION, current_resolution)
-        return [0, 0, w, h]
+        return [0, 0, orig_w, orig_h]
 
     def _get_label(self, class_id):
         """获取类别名称"""
@@ -286,15 +291,23 @@ class CUDAInferenceEngine(BaseInferenceEngine):
             self.cls_model = None
             self.cls_model_path = None
 
-    def infer(self, image):
-        """执行推理（检测 + 分类二级串联）"""
+    def infer(self, image, orig_size=None):
+        """执行推理（检测 + 分类二级串联）
+
+        Args:
+            image: BGR numpy 数组
+            orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
+        """
         t0 = time.time()
 
-        # 获取图片尺寸
-        orig_h, orig_w = image.shape[:2]
+        # 获取原始分辨率（DVPP 硬解时 image 已是 640x640，需用 orig_size）
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # 自适应检测区域
-        recog_area = self._get_adaptive_recog_area(image.shape)
+        recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
         recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
 
         # 整图 resize 到 640x640
@@ -414,15 +427,23 @@ class AscendInferenceEngine(BaseInferenceEngine):
         self._input_buffer[0] = img_float.transpose(2, 0, 1)
         return self._input_buffer
 
-    def infer(self, image):
-        """执行推理"""
+    def infer(self, image, orig_size=None):
+        """执行推理
+
+        Args:
+            image: BGR numpy 数组
+            orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
+        """
         t0 = time.time()
 
-        # 获取图片尺寸
-        orig_h, orig_w = image.shape[:2]
+        # 获取原始分辨率（DVPP 硬解时 image 已是 640x640，需用 orig_size）
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # 自适应检测区域
-        recog_area = self._get_adaptive_recog_area(image.shape)
+        recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
         recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
 
         # 预处理
