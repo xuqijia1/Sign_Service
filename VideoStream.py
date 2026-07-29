@@ -10,7 +10,7 @@ import requests
 import json
 from datetime import datetime
 from typing import Optional, List
-from SharedData import shared_data, DetectionBox, SignResult, get_sign_type
+from SharedData import shared_data, DetectionBox, SignResult, get_sign_type, ExamState
 from SignModel import SignModel
 
 try:
@@ -262,16 +262,32 @@ class VideoStream:
             return
 
         # 加载模型
+        # 加载模型（根据设备类型和 AIPP 模式选择模型路径）
+        use_aipp = self.config.get('AscendAipp', False)
+        if self.device_type == 'ascend':
+            # Ascend 模式：选择 OM 模型
+            if use_aipp:
+                model_path = self.config.get('ascend_aipp_model_path', './sign_aipp.om')
+                cls_model_path = self.config.get('ascend_aipp_cls_model_path', './sign_cls_aipp.om')
+            else:
+                model_path = self.config.get('ascend_model_path', './sign.om')
+                cls_model_path = self.config.get('ascend_cls_model_path', './sign_cls.om')
+        else:
+            model_path = self.model_path
+            cls_model_path = self.cls_model_path
+
         try:
             self.model = SignModel(
-                model_path=self.model_path,
+                model_path=model_path,
                 device_type=self.device_type,
                 cuda_device=self.cuda_device,
                 confidence_threshold=self.confidence_threshold,
-                cls_model_path=self.cls_model_path,
-                cls_conf_threshold=self.cls_conf_threshold
+                cls_model_path=cls_model_path,
+                cls_conf_threshold=self.cls_conf_threshold,
+                aipp=use_aipp
             )
-            logger.info("标志牌检测模型加载成功")
+            cls_info = f" + 分类模型: {cls_model_path}" if cls_model_path else ""
+            logger.info(f"标志牌检测模型加载成功: {model_path}{cls_info}")
         except Exception as e:
             logger.error(f"模型加载失败: {e}")
             return
@@ -315,6 +331,7 @@ class VideoStream:
         self.is_running = True
         self._consecutive_failures = 0
         self._last_dvpp_warn_ts = 0
+        self._force_reconnecting = False  # force_reconnect 期间置 True，阻止 _process_loop 干扰
 
         # 启动处理线程
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
@@ -352,7 +369,96 @@ class VideoStream:
             self.video_recorder.release()
             self.video_recorder = None
 
+        # 释放模型（NPU/GPU 资源）
+        if self.model is not None:
+            try:
+                if hasattr(self.model, 'engine') and self.model.engine is not None:
+                    if hasattr(self.model.engine, 'release'):
+                        self.model.engine.release()
+                self.model = None
+            except Exception as e:
+                logger.warning(f"模型释放异常: {e}")
+
         logger.info("视频流处理已停止")
+
+    def force_reconnect(self):
+        """强制 DVPP 完整重连（由 /start 在帧获取失败时调用）
+
+        soft_reset 不足以恢复长时间空闲后的死连接，需完整重建解码器。
+        设置 _force_reconnecting 标志防止 _process_loop 干扰。
+        VDEC 通道释放是异步的，507018 时需重试（递增等待）。
+        """
+        if not self.use_dvpp or not _HAS_DVPP:
+            return False
+        logger.warning("[FORCE-RECONNECT] 强制重建 DVPP 解码器...")
+        self._force_reconnecting = True
+        try:
+            # 1. 释放旧解码器
+            if self.dvpp_decoder is not None:
+                try:
+                    self.dvpp_decoder.release()
+                except Exception:
+                    pass
+                self.dvpp_decoder = None
+            # 2. 创建新解码器（507018 时重试，递增等待 VDEC 通道释放）
+            new_decoder = None
+            for attempt in range(3):
+                wait_s = 2.0 + attempt * 3.0  # 2s, 5s, 8s
+                logger.info(f"[FORCE-RECONNECT] 等待 {wait_s:.0f}s 后创建新解码器 (attempt {attempt+1}/3)")
+                time.sleep(wait_s)
+                new_decoder = create_dvpp_decoder(
+                    rtsp_url=self.camera_url,
+                    device_id=int(self.cuda_device) if self.device_type == 'ascend' else 0,
+                    en_type="H264",
+                )
+                # 校验是否真正创建了 DVPP 解码器（而非 Cv2Decoder 回退）
+                if new_decoder is not None and hasattr(new_decoder, 'src_width'):
+                    break
+                # Cv2Decoder 回退或 None，释放并重试
+                if new_decoder is not None:
+                    try:
+                        new_decoder.release()
+                    except Exception:
+                        pass
+                    new_decoder = None
+            if new_decoder is None or not hasattr(new_decoder, 'src_width'):
+                logger.error("[FORCE-RECONNECT] DVPP 重建 3 次均回退到 CPU 软解码，视为失败")
+                if new_decoder is not None:
+                    try:
+                        new_decoder.release()
+                    except Exception:
+                        pass
+                return False
+            self.dvpp_decoder = new_decoder
+            self.frame_width = self.dvpp_decoder.src_width or 1920
+            self.frame_height = self.dvpp_decoder.src_height or 1080
+            self.frame_fps = self.dvpp_decoder.fps or 25.0
+            self.orig_size = (self.dvpp_decoder.src_height, self.dvpp_decoder.src_width)
+            shared_data.frame_width = self.frame_width
+            shared_data.frame_height = self.frame_height
+            shared_data.frame_fps = self.frame_fps
+            self._consecutive_failures = 0
+            logger.info("[FORCE-RECONNECT] DVPP 解码器重建成功")
+            return True
+        except Exception as e:
+            logger.error(f"[FORCE-RECONNECT] DVPP 重建失败: {e}")
+            self.dvpp_decoder = None
+            return False
+        finally:
+            self._force_reconnecting = False
+
+    def is_streaming(self, max_wait=10.0):
+        """校验视频流是否在产出帧（通过 frame_count 增长判断）
+
+        用于 /start 校验视频源可用性。
+        """
+        start_count = shared_data.frame_count
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            if shared_data.frame_count > start_count:
+                return True
+            time.sleep(0.2)
+        return False
 
     def _open_video_source(self):
         """打开视频源"""
@@ -408,30 +514,97 @@ class VideoStream:
 
         while self.is_running:
             try:
+                # force_reconnect 期间跳过，避免 _process_loop 抢占 dvpp_decoder
+                if self._force_reconnecting:
+                    time.sleep(0.1)
+                    continue
+
+                # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
+                # demux 线程仍在后台拉流保活，RTSP 不会断
+                if shared_data.exam_state == ExamState.IDLE:
+                    time.sleep(0.5)
+                    continue
+
                 frame = None
+                use_aipp = self.config.get('AscendAipp', False)
 
                 if self.use_dvpp and self.dvpp_decoder:
-                    frame = self.dvpp_decoder.read_frame()
-                    if frame is not None:
-                        try:
-                            import acl
-                            acl.rt.set_device(self.dvpp_decoder.device_id)
-                        except Exception:
-                            pass
-                        self._consecutive_failures = 0
-                        if frame_count < 5:
-                            logger.info(f"DVPP 读帧成功: shape={frame.shape}")
-                    else:
-                        self._consecutive_failures += 1
-                        if self._consecutive_failures > 10:
-                            now_ts = time.time()
-                            if now_ts - self._last_dvpp_warn_ts > 30:
-                                logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
-                                self._last_dvpp_warn_ts = now_ts
-                            self.dvpp_decoder.soft_reset()
+                    if use_aipp:
+                        # AIPP 零拷贝路径：同时获取 NV12 device buffer 和 BGR 帧
+                        nv12_info, bgr_frame = self.dvpp_decoder.read_frame_aipp()
+                        if nv12_info is not None:
+                            try:
+                                import acl
+                                acl.rt.set_device(self.dvpp_decoder.device_id)
+                            except Exception:
+                                pass
                             self._consecutive_failures = 0
-                        time.sleep(0.05)
-                        continue
+                            frame = bgr_frame  # BGR 帧用于显示/录制
+
+                            # AIPP 零拷贝推理：直接传 device buffer，同时传 BGR 帧用于分类裁剪
+                            # 仅 RUNNING 状态推理，STARTING 期间只读帧供三级校验
+                            if shared_data.exam_state == ExamState.RUNNING:
+                                detections = self.model.detect(nv12_info, orig_size=self.orig_size, bgr_image=bgr_frame)
+                                boxes = []
+                                for det in detections:
+                                    box = DetectionBox(
+                                        X=det['x'],
+                                        Y=det['y'],
+                                        Width=det['width'],
+                                        Height=det['height'],
+                                        Label=det['label'],
+                                        Confidence=det['confidence']
+                                    )
+                                    boxes.append(box)
+                                shared_data.update_detections(boxes)
+                                if boxes:
+                                    if frame_count <= 5 or frame_count % 100 == 0:
+                                        labels = [b.Label for b in boxes]
+                                        logger.info(f"[AIPP] 检测: {len(boxes)}个 | 标签: {labels}")
+                                    best_box = max(boxes, key=lambda b: b.Confidence)
+                                    result = SignResult(
+                                        SignType=get_sign_type(best_box.Label),
+                                        SignName=best_box.Label,
+                                        IsCorrect=True,
+                                        Confidence=best_box.Confidence,
+                                        Boxes=boxes,
+                                        Timestamp=time.time()
+                                    )
+                                    shared_data.update_result(result)
+                        else:
+                            self._consecutive_failures += 1
+                            if self._consecutive_failures > 10:
+                                now_ts = time.time()
+                                if now_ts - self._last_dvpp_warn_ts > 30:
+                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
+                                    self._last_dvpp_warn_ts = now_ts
+                                self.dvpp_decoder.soft_reset()
+                                self._consecutive_failures = 0
+                            time.sleep(0.05)
+                            continue
+                    else:
+                        # 非 AIPP 路径：读取 BGR 帧
+                        frame = self.dvpp_decoder.read_frame()
+                        if frame is not None:
+                            try:
+                                import acl
+                                acl.rt.set_device(self.dvpp_decoder.device_id)
+                            except Exception:
+                                pass
+                            self._consecutive_failures = 0
+                            if frame_count < 5:
+                                logger.info(f"DVPP 读帧成功: shape={frame.shape}")
+                        else:
+                            self._consecutive_failures += 1
+                            if self._consecutive_failures > 10:
+                                now_ts = time.time()
+                                if now_ts - self._last_dvpp_warn_ts > 30:
+                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
+                                    self._last_dvpp_warn_ts = now_ts
+                                self.dvpp_decoder.soft_reset()
+                                self._consecutive_failures = 0
+                            time.sleep(0.05)
+                            continue
                 else:
                     if self.cap is None or not self.cap.isOpened():
                         logger.warning("视频源断开，尝试重连...")
@@ -453,13 +626,16 @@ class VideoStream:
                         continue
 
                 frame_count += 1
+                # 读帧计数（STARTING/RUNNING 都递增），供 is_streaming 校验帧产出
+                with shared_data.data_lock:
+                    shared_data.frame_count += 1
 
-                # 录制视频
-                if shared_data.is_recording and self.video_recorder is not None:
+                # 录制视频：仅 RUNNING 状态录制
+                if shared_data.exam_state == ExamState.RUNNING and self.video_recorder is not None:
                     self.video_recorder.write(frame)
 
-                # 执行检测
-                if shared_data.is_running:
+                # 执行检测（AIPP 模式已在上面处理，跳过）
+                if not use_aipp and shared_data.exam_state == ExamState.RUNNING:
                     detections = self.model.detect(frame, orig_size=self.orig_size)
 
                     # 转换为检测框列表
@@ -480,6 +656,9 @@ class VideoStream:
 
                     # 如果有检测结果，更新识别结果
                     if boxes:
+                        if frame_count <= 5 or frame_count % 100 == 0:
+                            labels = [b.Label for b in boxes]
+                            logger.info(f"检测: {len(boxes)}个 | 标签: {labels}")
                         # 取置信度最高的
                         best_box = max(boxes, key=lambda b: b.Confidence)
                         result = SignResult(
@@ -496,7 +675,7 @@ class VideoStream:
                 if self.config.get('show_window', False):
                     # 绘制检测框
                     display_frame = frame.copy()
-                    if shared_data.is_running and boxes:
+                    if shared_data.exam_state == ExamState.RUNNING and boxes:
                         display_frame = self._draw_boxes(display_frame, boxes)
                     cv2.imshow('Sign Detection', display_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -510,7 +689,7 @@ class VideoStream:
         """推送结果到客户端"""
         while self.is_running:
             try:
-                if not shared_data.is_running:
+                if shared_data.exam_state == ExamState.IDLE:
                     time.sleep(0.1)
                     continue
 

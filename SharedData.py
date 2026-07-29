@@ -5,6 +5,19 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from datetime import datetime
 
+
+class ExamState:
+    """考试状态机：统一管理读帧/推理/录制的生命周期，替代 is_running + is_recording 双布尔
+
+    IDLE      待考：读帧线程睡眠，不推理不录制
+    STARTING  /start 进行中：读帧线程读帧供三级校验，但跳过推理和录制
+    RUNNING   考试中：完整推理 + 录制
+    """
+    IDLE = 0
+    STARTING = 1
+    RUNNING = 2
+
+
 @dataclass
 class DetectionBox:
     """检测框数据"""
@@ -63,11 +76,8 @@ class SharedData:
         # 当前用户ID
         self.current_user_id: str = ""
 
-        # 是否正在运行
-        self.is_running: bool = False
-
-        # 是否正在录制
-        self.is_recording: bool = False
+        # 考试状态机（替代 is_running + is_recording）
+        self.exam_state: int = ExamState.IDLE
 
         # 最新检测结果
         self.latest_boxes: List[DetectionBox] = []
@@ -103,26 +113,24 @@ class SharedData:
         """重置状态"""
         with self.data_lock:
             self.current_user_id = ""
-            self.is_running = False
-            self.is_recording = False
+            self.exam_state = ExamState.IDLE
             self.latest_boxes = []
             self.latest_result = None
             self.recognized_signs = {}
             self.frame_count = 0
             self.start_time = 0.0
 
-    def set_running(self, running: bool):
-        """设置运行状态"""
+    def set_exam_state(self, state: int):
+        """设置考试状态（替代 set_running）"""
         with self.data_lock:
-            self.is_running = running
-            if running:
+            self.exam_state = state
+            if state == ExamState.RUNNING:
                 self.start_time = time.time()
 
     def update_detections(self, boxes: List[DetectionBox]):
-        """更新检测结果"""
+        """更新检测结果（frame_count 由读帧线程递增，此处不重复）"""
         with self.data_lock:
             self.latest_boxes = boxes
-            self.frame_count += 1
 
     def update_result(self, result: SignResult):
         """更新识别结果"""
@@ -148,7 +156,8 @@ class SharedData:
             return {
                 "recognized_signs": list(self.recognized_signs.keys()),
                 "frame_count": self.frame_count,
-                "is_running": self.is_running,
+                "exam_state": self.exam_state,
+                "is_running": self.exam_state != ExamState.IDLE,
                 "user_id": self.current_user_id,
                 "elapsed_time": time.time() - self.start_time if self.start_time > 0 else 0
             }

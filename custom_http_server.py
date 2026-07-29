@@ -7,7 +7,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any
 
-from SharedData import shared_data, DetectionBox, SignResult, get_sign_type
+from SharedData import shared_data, DetectionBox, SignResult, get_sign_type, ExamState
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,31 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning(f"解码器软复位异常: {e}")
 
+        # 提前设置 exam_state=STARTING，唤醒读帧线程（IDLE 时读帧线程在 sleep）
+        # 三级恢复的 is_streaming 依赖 frame_count 增长，而 frame_count 由读帧线程更新
+        # STARTING 期间读帧线程读帧，但推理和录制跳过
+        shared_data.set_exam_state(ExamState.STARTING)
+
+        # 帧校验 + 三级恢复：确保视频源可用后再开始考试
+        if vs is not None and vs.use_dvpp:
+            # Level 1: 等帧流 15s（自动重连可能已完成）
+            if not vs.is_streaming(max_wait=15):
+                # Level 2: soft_reset + 等帧 10s
+                if vs.dvpp_decoder is not None:
+                    try:
+                        vs.dvpp_decoder.soft_reset()
+                    except Exception:
+                        pass
+                if not vs.is_streaming(max_wait=10):
+                    # Level 3: 强制完整重连 + 等帧 30s
+                    logger.warning("soft_reset 未恢复，强制 DVPP 完整重连...")
+                    vs.force_reconnect()
+                    if not vs.is_streaming(max_wait=30):
+                        # 三级恢复全失败，恢复待考状态
+                        shared_data.set_exam_state(ExamState.IDLE)
+                        self._send_error_response('无法从视频源获取有效帧，请检查视频连接')
+                        return
+
         # 启动码流录制
         video_path = ""
         use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and
@@ -166,10 +191,9 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning(f"码流录制启动失败({e})")
                 video_path = ""
-        shared_data.is_recording = True
 
-        # 设置运行状态
-        shared_data.set_running(True)
+        # 录制启动成功，进入 RUNNING 状态（启动推理 + 录制写入）
+        shared_data.set_exam_state(ExamState.RUNNING)
 
         logger.info(f"开始识别: userid={userid}")
 
@@ -202,10 +226,17 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         # 获取识别结果
         results = shared_data.get_all_results()
 
-        # 重置状态
-        shared_data.set_running(False)
-        shared_data.is_recording = False
+        # 重置状态：IDLE 同时停止读帧/推理/录制
+        shared_data.set_exam_state(ExamState.IDLE)
         shared_data.current_user_id = ""
+
+        # soft_reset 清理 DVPP 脏状态，避免下次 /start 残留旧帧
+        vs2 = shared_data.video_recorder
+        if vs2 is not None and vs2.dvpp_decoder is not None:
+            try:
+                vs2.dvpp_decoder.soft_reset()
+            except Exception as e:
+                logger.warning(f"DVPP soft_reset 异常: {e}")
 
         logger.info(f"停止识别: userid={userid}, video_path={video_path}")
 
@@ -274,8 +305,9 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         all_results = shared_data.get_all_results()
 
         data = {
+            'exam_state': all_results.get('exam_state', ExamState.IDLE),
             'is_running': all_results.get('is_running', False),
-            'is_recording': shared_data.is_recording,
+            'is_recording': all_results.get('exam_state', ExamState.IDLE) == ExamState.RUNNING,
             'user_id': all_results.get('user_id', ''),
             'frame_count': all_results.get('frame_count', 0),
             'elapsed_time': all_results.get('elapsed_time', 0),

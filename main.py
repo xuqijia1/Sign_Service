@@ -4,6 +4,7 @@ import sys
 import json
 import logging
 import platform
+import signal
 from datetime import datetime
 
 # 配置日志
@@ -106,6 +107,12 @@ def load_config():
 def main():
     """主入口"""
     global VIDEO_STREAM, HTTP_SERVER
+
+    # SIGTERM -> KeyboardInterrupt，确保 finally 清理块执行（容器停止时优雅退出）
+    def _sigterm_handler(signum, frame):
+        logger.warning(f"接收到信号 {signum}，触发优雅退出...")
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     logger.info("=" * 50)
     logger.info("Sign_Service 标志牌识别服务启动")

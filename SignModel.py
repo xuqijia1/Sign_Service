@@ -15,7 +15,8 @@ class SignModel:
 
     def __init__(self, model_path: str, device_type: str = "gpu", cuda_device: int = 0,
                  confidence_threshold: float = 0.5, recog_area=None,
-                 cls_model_path: str = None, cls_conf_threshold: float = 0.5):
+                 cls_model_path: str = None, cls_conf_threshold: float = 0.5,
+                 aipp: bool = False):
         self.model_path = model_path
         self.device_type = device_type.lower()
         self.cuda_device = cuda_device
@@ -23,6 +24,7 @@ class SignModel:
         self.recog_area = recog_area
         self.cls_model_path = cls_model_path
         self.cls_conf_threshold = cls_conf_threshold
+        self.aipp = aipp
 
         # 加载类别名称
         self.class_names = load_class_names()
@@ -55,7 +57,8 @@ class SignModel:
                 names=self.class_names,
                 device_id=self.cuda_device,
                 cls_model_path=self.cls_model_path,
-                cls_conf_threshold=self.cls_conf_threshold
+                cls_conf_threshold=self.cls_conf_threshold,
+                aipp=self.aipp
             )
             cls_info = f" + 分类模型: {self.cls_model_path}" if self.cls_model_path else ""
             logger.info(f"推理引擎创建成功: {self.model_path}{cls_info}, 设备: {self.device_type}")
@@ -63,15 +66,16 @@ class SignModel:
             logger.error(f"推理引擎创建失败: {e}")
             raise
 
-    def detect(self, frame, orig_size=None) -> List[dict]:
+    def detect(self, frame, orig_size=None, bgr_image=None) -> List[dict]:
         """执行检测
 
         Args:
-            frame: BGR 格式图片
+            frame: BGR 格式图片，或 AIPP 模式下的 device buffer dict
             orig_size: (orig_h, orig_w) 原始分辨率，DVPP 硬解时必须传入
+            bgr_image: AIPP 模式下传入的 BGR 原图（用于分类裁剪）
         """
         try:
-            return self.engine.infer(frame, orig_size=orig_size)
+            return self.engine.infer(frame, orig_size=orig_size, bgr_image=bgr_image)
         except Exception as e:
             logger.error(f"检测失败: {e}")
             return []

@@ -4,6 +4,10 @@
     "camera_url": "./sign_test.mp4",
     "model_path": "./sign.pt",
     "cls_model_path": "./sign_cls.pt",
+    "ascend_model_path": "./sign.om",
+    "ascend_cls_model_path": "./sign_cls.om",
+    "ascend_aipp_model_path": "./sign_aipp.om",
+    "ascend_aipp_cls_model_path": "./sign_cls_aipp.om",
     "cls_conf_threshold": 0.5,
     "CudaDevice": 0,
     "confidence_threshold": 0.5,
@@ -19,5 +23,6 @@
         "en_type": "H264",
         "out_format": "NV12",
         "auto_detect_codec": true
-    }
+    },
+    "AscendAipp": false
 }
