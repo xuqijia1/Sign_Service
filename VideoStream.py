@@ -292,7 +292,7 @@ class VideoStream:
             logger.error(f"模型加载失败: {e}")
             return
 
-        # 尝试 DVPP 硬解码
+        # Ascend 环境 DVPP 硬解码：create_dvpp_decoder 失败抛 RuntimeError，不回退 cv2
         if _HAS_DVPP and self.camera_url.startswith('rtsp://'):
             try:
                 self.dvpp_decoder = create_dvpp_decoder(
@@ -310,18 +310,12 @@ class VideoStream:
                 shared_data.frame_fps = self.frame_fps
                 logger.info(f"DVPP 硬解码已启动: {self.camera_url} | "
                             f"{self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f}fps")
-            except RuntimeError as e:
-                logger.warning(f"DVPP 硬解码启动失败({e})，回退 cv2")
-                self.dvpp_decoder = None
-                self.use_dvpp = False
-                self.orig_size = None
             except Exception as e:
-                logger.warning(f"DVPP 硬解码启动异常({e})，回退 cv2")
-                self.dvpp_decoder = None
-                self.use_dvpp = False
-                self.orig_size = None
+                # Ascend 环境硬解码失败不回退 cv2，向上抛异常由调用方决定重试或终止
+                logger.error(f"DVPP 硬解码启动失败（不回退 cv2）: {e}")
+                raise RuntimeError(f"DVPP 硬解码启动失败（不回退 cv2）: {e}")
 
-        # cv2 回退
+        # 非 Ascend 环境：使用 cv2 软解码作为兼容方案
         if not self.use_dvpp:
             self._open_video_source()
             if self.cap is None or not self.cap.isOpened():
@@ -401,33 +395,34 @@ class VideoStream:
                     pass
                 self.dvpp_decoder = None
             # 2. 创建新解码器（507018 时重试，递增等待 VDEC 通道释放）
+            # Ascend 环境 create_dvpp_decoder 失败直接抛 RuntimeError，不回退 cv2
             new_decoder = None
-            for attempt in range(3):
-                wait_s = 2.0 + attempt * 3.0  # 2s, 5s, 8s
-                logger.info(f"[FORCE-RECONNECT] 等待 {wait_s:.0f}s 后创建新解码器 (attempt {attempt+1}/3)")
+            max_attempts = 5
+            wait_schedule = [2.0, 5.0, 8.0, 15.0, 30.0]  # 总计 60s
+            for attempt in range(max_attempts):
+                wait_s = wait_schedule[attempt]
+                logger.info(f"[FORCE-RECONNECT] 等待 {wait_s:.0f}s 后创建新解码器 (attempt {attempt+1}/{max_attempts})")
                 time.sleep(wait_s)
-                new_decoder = create_dvpp_decoder(
-                    rtsp_url=self.camera_url,
-                    device_id=int(self.cuda_device) if self.device_type == 'ascend' else 0,
-                    en_type="H264",
-                )
-                # 校验是否真正创建了 DVPP 解码器（而非 Cv2Decoder 回退）
-                if new_decoder is not None and hasattr(new_decoder, 'src_width'):
-                    break
-                # Cv2Decoder 回退或 None，释放并重试
-                if new_decoder is not None:
-                    try:
-                        new_decoder.release()
-                    except Exception:
-                        pass
+                try:
+                    new_decoder = create_dvpp_decoder(
+                        rtsp_url=self.camera_url,
+                        device_id=int(self.cuda_device) if self.device_type == 'ascend' else 0,
+                        en_type="H264",
+                    )
+                    # 成功（force_reconnect 仅在 _HAS_DVPP=True 即 Ascend 环境调用，
+                    # create_dvpp_decoder 必返回 AclVdecDecoder 或抛 RuntimeError）
+                    if new_decoder is not None:
+                        break
+                except RuntimeError as e:
+                    logger.warning(f"[FORCE-RECONNECT] attempt {attempt+1}/{max_attempts} 失败: {e}")
                     new_decoder = None
-            if new_decoder is None or not hasattr(new_decoder, 'src_width'):
-                logger.error("[FORCE-RECONNECT] DVPP 重建 3 次均回退到 CPU 软解码，视为失败")
-                if new_decoder is not None:
-                    try:
-                        new_decoder.release()
-                    except Exception:
-                        pass
+                    if attempt < max_attempts - 1:
+                        continue
+                    else:
+                        logger.error(f"[FORCE-RECONNECT] DVPP 重建 {max_attempts} 次均失败（最后尝试: {e}）")
+                        return False
+            if new_decoder is None:
+                logger.error("[FORCE-RECONNECT] DVPP 重建失败：解码器为 None")
                 return False
             self.dvpp_decoder = new_decoder
             self.frame_width = self.dvpp_decoder.src_width or 1920

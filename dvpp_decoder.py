@@ -1516,20 +1516,22 @@ class AclVdecDecoder(BaseVideoDecoder):
         self._flush_desc_queue()
 
         # VDEC
+        # 1) 先停 callback 线程，确保不再有在途的 VDEC 回调持有通道资源
         self._vdec_run = False
-        time.sleep(0.5)
-        if self._vdec_ch_desc is not None:
-            acl.media.vdec_destroy_channel(self._vdec_ch_desc)
-            self._vdec_ch_desc = None
-        if self._frame_cfg is not None:
-            acl.media.vdec_destroy_frame_config(self._frame_cfg)
-            self._frame_cfg = None
         if self._cb_tid is not None:
             try:
                 acl.util.stop_thread(self._cb_tid)
             except Exception:
                 pass
             self._cb_tid = None
+        # 2) 等待通道资源稳定后销毁 channel（507018 多发于此，加长等待）
+        time.sleep(1.0)
+        if self._vdec_ch_desc is not None:
+            acl.media.vdec_destroy_channel(self._vdec_ch_desc)
+            self._vdec_ch_desc = None
+        if self._frame_cfg is not None:
+            acl.media.vdec_destroy_frame_config(self._frame_cfg)
+            self._frame_cfg = None
         if self._input_buf is not None:
             acl.media.dvpp_free(self._input_buf)
             self._input_buf = None
@@ -1604,23 +1606,25 @@ class AclVdecDecoder(BaseVideoDecoder):
 def create_dvpp_decoder(rtsp_url, device_id=0, channel_id=None, en_type="H264",
                          auto_detect_codec=True, use_vpc=True):
     """
-    创建解码器（优先 acl 原生 VDEC，回退 CPU 软解码）
+    创建解码器
+
+    - Ascend 环境（_HAS_ACL and _HAS_PYAV）：必须使用 AclVdecDecoder 硬解码，
+      失败直接抛 RuntimeError，**不回退 Cv2Decoder**。调用方应重试或终止。
+    - 非 Ascend 环境（无 acl）：使用 Cv2Decoder 软解码作为兼容方案。
 
     Args:
         channel_id: VDEC 通道 ID。None=自动分配，int=指定通道。
-                    Docker 多服务部署建议通过环境变量 DVPP_CHANNEL_ID 指定。
-        use_vpc: True=VPC 硬件 NV12→BGR（推荐，零 CPU 色彩转换）
-                 False=CPU cv2.cvtColor 转换
+        use_vpc: True=VPC 硬件 NV12→BGR（推荐），False=CPU cv2.cvtColor
 
     Returns:
-        AclVdecDecoder 或 Cv2Decoder 实例
+        AclVdecDecoder（Ascend）或 Cv2Decoder（非 Ascend）
 
     Raises:
-        RuntimeError: 所有解码器启动失败，附带失败原因
+        RuntimeError: Ascend 环境下 VDEC 启动失败，附带失败原因
     """
     errors = []
 
-    # 优先 acl 原生 VDEC（全 NPU 链路，零 CPU 图像搬运）
+    # Ascend 环境：仅使用 AclVdecDecoder，失败抛异常（不回退 cv2）
     if _HAS_ACL and _HAS_PYAV:
         try:
             decoder = AclVdecDecoder(
@@ -1633,19 +1637,24 @@ def create_dvpp_decoder(rtsp_url, device_id=0, channel_id=None, en_type="H264",
             if decoder.start():
                 return decoder
             errors.append("AclVdecDecoder start() returned False")
-            decoder.release()
+            try:
+                decoder.release()
+            except Exception:
+                pass
         except Exception as e:
             errors.append(f"AclVdecDecoder 异常: {e}")
-    elif not _HAS_ACL:
-        errors.append("acl 模块不可用")
+        raise RuntimeError("Ascend DVPP 硬解码启动失败: " + "; ".join(errors))
+
+    # 非 Ascend 环境：使用 Cv2Decoder 作为兼容方案
+    if not _HAS_ACL:
+        errors.append("acl 模块不可用（非 Ascend 环境）")
     elif not _HAS_PYAV:
         errors.append("PyAV(av) 模块不可用")
 
-    # 回退 CPU 软解码（OpenCV）
     try:
         decoder = Cv2Decoder(rtsp_url=rtsp_url)
         if decoder.start():
-            print(f"[create_dvpp_decoder] 回退 CPU 软解码: {rtsp_url}")
+            print(f"[create_dvpp_decoder] 非 Ascend 环境，使用 CPU 软解码: {rtsp_url}")
             return decoder
         errors.append("Cv2Decoder start() returned False")
     except Exception as e:
