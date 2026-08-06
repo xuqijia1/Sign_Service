@@ -17,8 +17,8 @@ mandatory_shoes
 mandatory_gloves
 mandatory_belt
 info_three_phase
-info_work_here
-info_emergency_stop
-info_overvoltage
 info_live_work
-info_anti_interference
+info_emergency_phone
+info_assembly_point
+info_emergency_exit
+info_first_aid

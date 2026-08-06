@@ -779,12 +779,12 @@ class VideoStream:
             'mandatory_shoes': '必须穿防护鞋',
             'mandatory_gloves': '必须戴防护手套',
             'mandatory_belt': '必须系安全带',
-            'info_three_phase': '三相电提示',
-            'info_work_here': '在此工作',
-            'info_emergency_stop': '紧急停止',
-            'info_overvoltage': '过电压提示',
-            'info_live_work': '带电作业',
-            'info_anti_interference': '抗干扰标识'
+            'info_three_phase': '动火作业区',
+            'info_live_work': '紧急破窗',
+            'info_emergency_phone': '紧急电话',
+            'info_assembly_point': '紧急集合点',
+            'info_emergency_exit': '紧急出口',
+            'info_first_aid': '急救'
         }
 
         for box in boxes:
