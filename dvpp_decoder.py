@@ -18,7 +18,6 @@ import os
 import time
 import queue
 import threading
-import glob
 import numpy as np
 
 try:
@@ -338,16 +337,6 @@ class Cv2Decoder(BaseVideoDecoder):
     def is_started(self):
         return self._started
 
-    @property
-    def is_recording(self):
-        return False
-
-    def start_record(self, save_path):
-        print("[Cv2Decoder] 不支持码流录制")
-
-    def stop_record(self):
-        return ""
-
 
 # ==================== acl 原生 VDEC + VPC 解码器 ====================
 
@@ -383,148 +372,12 @@ def _get_h265_nal_type(data):
     return -1
 
 
-class PyAvStreamRecorder:
-    """PyAV 原始码流remux录制，修复av.Fraction不存在、参数警告、22报错"""
-
-    def __init__(self, seg_sec=300):
-        self._seg_sec = seg_sec
-        self._save_dir = ""
-        self._base_name = ""
-        self._out_container = None
-        self._out_stream = None
-        self._start_ts = None
-        self._seq = 0
-        self._recording = False
-        self._pkt_count = 0
-        self._current_path = ""
-        self._lock = threading.Lock()
-
-    def start_record(self, save_path):
-        """启动录制，传入最终MP4完整路径"""
-        self.stop_record()
-        self._save_dir = os.path.dirname(os.path.abspath(save_path))
-        self._base_name = os.path.splitext(os.path.basename(save_path))[0]
-        os.makedirs(self._save_dir, exist_ok=True)
-        self._recording = True
-        self._pkt_count = 0
-        self._seq = 0
-        self._new_segment()
-        print(f"[PyAvRec] 录制启动 分片{self._seg_sec}s | 目录:{self._save_dir}")
-
-    def _new_segment(self):
-        """新建分片MP4，移除无效vcodec参数"""
-        self._close_segment()
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        fname = os.path.join(self._save_dir, f"{self._base_name}_{self._seq}_{ts}.mp4")
-        self._current_path = fname
-        self._seq += 1
-        try:
-            # 只保留容器合法参数，删除vcodec（会报未使用警告）
-            self._out_container = _av.open(
-                fname,
-                mode="w",
-                format="mp4",
-                options={
-                    "movflags": "+faststart+empty_moov",
-                    "strict": "-2"
-                }
-            )
-            self._out_stream = None
-            self._start_ts = time.time()
-        except Exception as e:
-            print(f"[PyAvRec] 创建分片失败: {e}")
-            self._out_container = None
-
-    def _close_segment(self):
-        """关闭当前分片，刷新缓存"""
-        if self._out_container is not None:
-            try:
-                self._out_container.close()
-            except Exception:
-                pass
-            self._out_container = None
-            self._out_stream = None
-
-    def write_packet(self, pkt):
-        """写入码流包：移除av.Fraction强制赋值，兼容旧版PyAV"""
-        if not self._recording or self._out_container is None or pkt.size <= 0:
-            return
-        with self._lock:
-            # 分片超时切换文件
-            if time.time() - self._start_ts > self._seg_sec:
-                self._new_segment()
-                return
-            # 首包创建输出流（add_stream_from_template 拷贝全部编码参数，remux 零编码）
-            if self._out_stream is None:
-                try:
-                    self._out_stream = self._out_container.add_stream_from_template(pkt.stream)
-                    print(f"[PyAvRec] 输出流创建(remux) {pkt.stream.width}x{pkt.stream.height}")
-                except Exception as e:
-                    print(f"[PyAvRec] 创建输出流失败: {e}")
-                    return
-            # 直接复用packet原生time_base，不再手动覆盖Fraction
-            pkt.stream = self._out_stream
-            try:
-                self._out_container.mux(pkt)
-                self._pkt_count += 1
-            except Exception as e:
-                if self._pkt_count <= 5:
-                    print(f"[PyAvRec] write_packet 异常: {e}")
-
-    def stop_record(self):
-        """停止录制，自动合并所有分片为单个MP4，清理碎片"""
-        with self._lock:
-            self._recording = False
-            self._close_segment()
-        # 匹配所有分片文件
-        seg_pattern = os.path.join(self._save_dir, f"{self._base_name}_*.mp4")
-        seg_list = sorted(glob.glob(seg_pattern))
-        target_mp4 = os.path.join(self._save_dir, f"{self._base_name}.mp4")
-        if not seg_list:
-            self._current_path = ""
-            return ""
-        # 生成concat列表
-        list_file = os.path.join(self._save_dir, "concat_tmp.txt")
-        with open(list_file, "w", encoding="utf-8") as f:
-            for file in seg_list:
-                f.write(f"file '{file}'\n")
-        # 纯拷贝合并，无软编码
-        merge_cmd = [
-            _get_ffmpeg_bin(), "-y", "-f", "concat", "-safe", "0",
-            "-i", list_file, "-c", "copy", target_mp4
-        ]
-        try:
-            subprocess.run(merge_cmd, capture_output=True, timeout=600)
-            # 合并成功删除分片与临时清单
-            for seg in seg_list:
-                os.remove(seg)
-            os.remove(list_file)
-            self._current_path = target_mp4
-            print(f"[PyAvRec] 录制停止，自动合并完成，总包数:{self._pkt_count} 视频:{target_mp4}")
-        except Exception as e:
-            print(f"[PyAvRec] 分片合并失败，保留分段文件: {e}")
-            self._current_path = seg_list[-1]
-        return self._current_path
-
-    @property
-    def recording(self):
-        return self._recording
-
-    @property
-    def current_path(self):
-        return self._current_path
-
-    @property
-    def packet_count(self):
-        return self._pkt_count
-
-
 class AclVdecDecoder(BaseVideoDecoder):
     """acl 原生 VDEC + VPC 全 NPU 解码器
 
     PyAV 拉 RTSP → acl VDEC 解码(device NV12) → VPC crop_resize+convert_color(device BGR)
 
-    read_frame():       返回 BGR numpy (VPC 硬件转换 + D2H，用于录制/MJPEG)
+    read_frame():       返回 BGR numpy (VPC 硬件转换 + D2H，用于 MJPEG/显示)
     read_frame_device(): 返回 (dev_nv12_ptr, size) (VPC resize 后的 NV12，零拷贝给推理)
     """
 
@@ -587,11 +440,6 @@ class AclVdecDecoder(BaseVideoDecoder):
         self._frame_queue = queue.Queue(maxsize=4)
         # 延迟销毁队列（回调存入 desc，主线程 destroy，避免回调线程 double free）
         self._desc_queue = queue.Queue(maxsize=64)
-
-        # PyAV 原始码流录制（零 CPU 编码，直接 mux 原始 H264/H265 到 MP4）
-        self._stream_recorder = None
-        self._recording = False
-        self._record_save_path = ""
 
     # ==================== VDEC 回调 ====================
 
@@ -894,13 +742,9 @@ class AclVdecDecoder(BaseVideoDecoder):
         return True
 
     def _demux_loop(self):
-        """demux 线程主循环：PyAV demux → NAL 队列 + 录制分流
+        """demux 线程主循环：PyAV demux -> NAL 队列 -> VDEC 解码
 
         此线程独占 PyAV container，不与其他线程共享。
-        Packet 同时分流两路：
-          1. 录制：原始码流直接 mux 写入 MP4（零 CPU 编码）
-          2. 推理：bytes(packet) 送 NAL 队列 → VDEC 解码
-
         连接断开后自动重试，直到 _demux_running 被设为 False。
         """
         while self._demux_running:
@@ -914,11 +758,7 @@ class AclVdecDecoder(BaseVideoDecoder):
                 for packet in container.demux([video_stream]):
                     if not self._demux_running:
                         break
-                    # 第一路：原始码流直接 mux 写入 MP4（零 CPU 编码）
-                    if self._recording and self._stream_recorder is not None:
-                        if packet.dts is not None and packet.size > 0:
-                            self._stream_recorder.write_packet(packet)
-                    # 第二路：NAL 包送队列 → VDEC 解码
+                    # NAL 包送队列 -> VDEC 解码
                     nal = bytes(packet)
                     if len(nal) == 0:
                         continue
@@ -1319,7 +1159,7 @@ class AclVdecDecoder(BaseVideoDecoder):
         }
 
     def read_frame_aipp(self):
-        """读取一帧，同时返回 NV12 device buffer（AIPP 零拷贝推理）和 BGR 帧（显示/录制）
+        """读取一帧，同时返回 NV12 device buffer（AIPP 零拷贝推理）和 BGR 帧（显示）
 
         Returns:
             tuple: (nv12_dict, bgr_frame)
@@ -1447,59 +1287,9 @@ class AclVdecDecoder(BaseVideoDecoder):
 
         print(f"[AclVdec] 软复位完成，缓存全部清空")
 
-    # ==================== PyAV 原始码流录制 ====================
-
-    def start_record(self, save_path):
-        """启动 PyAV 原始码流录制（零 CPU 编码，直接 mux 原始 H264/H265 到 MP4）
-
-        Args:
-            save_path: 最终 MP4 文件路径（如 /xxx/record.mp4）
-        """
-        if self._recording:
-            print("[PyAvRec] 录制已在运行")
-            return
-        if not self._started:
-            print("[PyAvRec] 解码器未启动，无法录制")
-            return
-        if self._stream_recorder is None:
-            self._stream_recorder = PyAvStreamRecorder(seg_sec=300)
-        self._stream_recorder.start_record(save_path)
-        self._recording = True
-        self._record_save_path = save_path
-        print(f"[AclVdec] 开始码流录制: {save_path}")
-
-    def stop_record(self):
-        """停止码流录制，返回 MP4 路径"""
-        if not self._recording or self._stream_recorder is None:
-            return ""
-        self._recording = False
-        mp4_path = self._stream_recorder.stop_record()
-        self._record_save_path = mp4_path
-        print(f"[AclVdec] 停止录制: {mp4_path}")
-        return mp4_path
-
-    @property
-    def is_recording(self):
-        """录制状态"""
-        return self._recording
-
-    @property
-    def record_save_path(self):
-        """当前录制文件路径"""
-        if self._stream_recorder is not None:
-            return self._stream_recorder.current_path or self._record_save_path
-        return self._record_save_path
-
     def release(self):
         """释放所有资源"""
         self._started = False
-
-        # 停止码流录制
-        if self._recording:
-            self.stop_record()
-        if self._stream_recorder is not None:
-            self._stream_recorder.stop_record()
-            self._stream_recorder = None
 
         # 先停 demux 线程，不再有新 NAL 数据
         self._stop_demux()

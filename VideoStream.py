@@ -2,9 +2,7 @@
 import os
 import cv2
 import time
-import shutil
 import threading
-import subprocess
 import logging
 import requests
 import json
@@ -21,199 +19,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-class JpegFrameRecorder:
-    """JPEG 帧录制器 — 录制期间存 JPEG，分段流式合成视频"""
-
-    CHUNK_SIZE = 500
-
-    def __init__(self, output_path, fps, width, height,
-                 max_duration_minutes=0, jpeg_quality=85, chunk_size=500):
-        self._output_path = output_path
-        self.fps = fps
-        self.width = width
-        self.height = height
-        self._max_duration = max_duration_minutes * 60 if max_duration_minutes > 0 else 0
-        self._jpeg_quality = jpeg_quality
-        self._chunk_size = chunk_size
-        self._tmp_dir = output_path + ".frames"
-        self._frame_idx = 0
-        self._chunk_idx = 0
-        self._chunk_frames = 0
-        self._closed = False
-        self._segments = []
-        self._has_ffmpeg = None
-        self._min_frame_interval = 1.0 / fps if fps > 0 else 0
-        self._last_frame_time = 0.0
-        self._lock = threading.Lock()
-        self._start_time = time.time()
-        os.makedirs(self._tmp_dir, exist_ok=True)
-
-    @property
-    def output_path(self):
-        return self._output_path
-
-    @property
-    def frame_count(self):
-        return self._frame_idx
-
-    def write(self, frame) -> bool:
-        with self._lock:
-            if self._closed:
-                return False
-            now = time.time()
-            if self._min_frame_interval > 0 and now - self._last_frame_time < self._min_frame_interval:
-                return True
-            self._last_frame_time = now
-            if self._max_duration > 0 and now - self._start_time >= self._max_duration:
-                self._close_internal()
-                return False
-            path = os.path.join(self._tmp_dir, f"{self._frame_idx:07d}.jpg")
-            cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
-            self._frame_idx += 1
-            self._chunk_frames += 1
-            if self._chunk_frames >= self._chunk_size:
-                self._flush_chunk()
-            return True
-
-    def isOpened(self) -> bool:
-        return not self._closed
-
-    def release(self):
-        with self._lock:
-            self._close_internal()
-
-    def _close_internal(self):
-        if self._closed:
-            return
-        self._closed = True
-        if self._frame_idx == 0:
-            self._cleanup()
-            return
-        t = threading.Thread(target=self._finalize, daemon=True)
-        t.start()
-        logger.info(f"录制停止，后台合成视频中... ({self._frame_idx}帧, {len(self._segments)}段)")
-
-    def _finalize(self):
-        try:
-            if self._chunk_frames > 0:
-                self._flush_chunk()
-            if self._segments:
-                self._concat_segments()
-            self._cleanup()
-        except Exception as e:
-            logger.error(f"后台合成异常: {e}")
-
-    def _check_ffmpeg(self):
-        if self._has_ffmpeg is None:
-            self._has_ffmpeg = shutil.which('ffmpeg') is not None
-        return self._has_ffmpeg
-
-    def _flush_chunk(self):
-        if self._chunk_frames == 0:
-            return
-        if not self._check_ffmpeg():
-            self._chunk_frames = 0
-            return
-        seg_path = os.path.join(self._tmp_dir, f"seg_{self._chunk_idx:04d}.mp4")
-        start_idx = self._frame_idx - self._chunk_frames
-        if self._mux_jpeg_to_mp4(start_idx, self._chunk_frames, seg_path):
-            self._segments.append(seg_path)
-            for i in range(start_idx, self._frame_idx):
-                try:
-                    os.remove(os.path.join(self._tmp_dir, f"{i:07d}.jpg"))
-                except OSError:
-                    pass
-        self._chunk_idx += 1
-        self._chunk_frames = 0
-
-    def _mux_jpeg_to_mp4(self, start_idx, count, output):
-        try:
-            cmd = [
-                'ffmpeg', '-y',
-                '-framerate', str(self.fps),
-                '-start_number', str(start_idx),
-                '-i', os.path.join(self._tmp_dir, '%07d.jpg'),
-                '-frames:v', str(count),
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-pix_fmt', 'yuv420p',
-                output
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
-            if result.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
-                return True
-            cmd = [
-                'ffmpeg', '-y',
-                '-framerate', str(self.fps),
-                '-start_number', str(start_idx),
-                '-i', os.path.join(self._tmp_dir, '%07d.jpg'),
-                '-frames:v', str(count),
-                '-c:v', 'mpeg4', '-q:v', '5',
-                output
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
-            if result.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            self._has_ffmpeg = False
-        except Exception as e:
-            logger.error(f"ffmpeg 合成失败: {e}")
-        return False
-
-    def _concat_segments(self):
-        if len(self._segments) == 1:
-            try:
-                os.rename(self._segments[0], self._output_path)
-                size = os.path.getsize(self._output_path)
-                logger.info(f"视频合成完成: {self._output_path} ({size:,} bytes, {self._frame_idx}帧)")
-            except OSError:
-                self._try_copy_segment()
-        else:
-            concat_file = os.path.join(self._tmp_dir, "concat.txt")
-            try:
-                with open(concat_file, 'w') as f:
-                    for seg in self._segments:
-                        f.write(f"file '{seg}'\n")
-                cmd = [
-                    'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                    '-i', concat_file, '-c', 'copy', self._output_path
-                ]
-                result = subprocess.run(cmd, capture_output=True, timeout=120)
-                if result.returncode == 0 and os.path.exists(self._output_path):
-                    size = os.path.getsize(self._output_path)
-                    logger.info(f"视频拼接完成: {self._output_path} ({size:,} bytes, {self._frame_idx}帧)")
-                else:
-                    cmd = [
-                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                        '-i', concat_file,
-                        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                        self._output_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, timeout=120)
-                    if result.returncode == 0 and os.path.exists(self._output_path):
-                        size = os.path.getsize(self._output_path)
-                        logger.info(f"视频重编码拼接完成: {self._output_path} ({size:,} bytes)")
-                    else:
-                        self._try_copy_segment()
-            except Exception as e:
-                logger.error(f"视频拼接失败: {e}")
-                self._try_copy_segment()
-
-    def _try_copy_segment(self):
-        if self._segments and os.path.exists(self._segments[0]):
-            try:
-                shutil.copy2(self._segments[0], self._output_path)
-                size = os.path.getsize(self._output_path)
-                logger.info(f"保留第一段视频: {self._output_path} ({size:,} bytes)")
-            except Exception:
-                logger.error(f"视频保存失败，JPEG 帧序列保留在: {self._tmp_dir}/")
-
-    def _cleanup(self):
-        try:
-            if os.path.isdir(self._tmp_dir):
-                shutil.rmtree(self._tmp_dir)
-        except Exception:
-            pass
 
 class VideoStream:
     """视频流处理类"""
@@ -244,12 +49,7 @@ class VideoStream:
         # 模型
         self.model: Optional[SignModel] = None
 
-        # 视频录制器（由 custom_http_server 创建和管理）
-        self.video_recorder = None
-        video_dir = config.get('video_save_dir', '/home/kickpi/ExamVideos/Sign')
-        if not os.path.isabs(video_dir):
-            video_dir = os.path.join(os.path.dirname(__file__), video_dir)
-        self._video_save_dir = video_dir
+        # VideoStream 引用，供 HTTP 层访问 dvpp_decoder（不再做服务端录制）
         shared_data.video_recorder = self
 
         # 推送控制
@@ -326,6 +126,9 @@ class VideoStream:
         self._consecutive_failures = 0
         self._last_dvpp_warn_ts = 0
         self._force_reconnecting = False  # force_reconnect 期间置 True，阻止 _process_loop 干扰
+        self.is_healthy = False  # 流健康标志（IDLE 时由 _process_loop 探测维护，/start 非阻塞检查）
+        self._last_probe_time = 0.0  # 上次健康探测时间
+        self._probe_fail_count = 0  # 连续探测失败次数
 
         # 启动处理线程
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
@@ -358,10 +161,6 @@ class VideoStream:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-
-        if self.video_recorder is not None:
-            self.video_recorder.release()
-            self.video_recorder = None
 
         # 释放模型（NPU/GPU 资源）
         if self.model is not None:
@@ -442,6 +241,34 @@ class VideoStream:
         finally:
             self._force_reconnecting = False
 
+    def probe_health(self):
+        """流健康探测：拉一帧验证流可解，维护 is_healthy。
+
+        IDLE 时由 _process_loop 周期调用，/start 非阻塞查 is_healthy。
+        AIPP 走 read_frame_aipp（内部已 dvpp_free(vdec_buffer)，返回的 nv12_dict['buffer']
+        是复用的 _dev_rsz_nv12 不能 free），非 AIPP 走 read_frame。probe 零清理。
+        """
+        if not (self.use_dvpp and self.dvpp_decoder and self.dvpp_decoder.is_started):
+            self.is_healthy = False
+            return False
+        try:
+            use_aipp = self.config.get('AscendAipp', False)
+            if use_aipp:
+                nv12_info, _ = self.dvpp_decoder.read_frame_aipp()
+                ok = nv12_info is not None
+            else:
+                frame = self.dvpp_decoder.read_frame()
+                ok = frame is not None
+            if ok:
+                self.is_healthy = True
+                self._probe_fail_count = 0
+                return True
+        except Exception as e:
+            logger.warning(f"健康探测异常: {e}")
+        self._probe_fail_count += 1
+        self.is_healthy = False
+        return False
+
     def is_streaming(self, max_wait=10.0):
         """校验视频流是否在产出帧（通过 frame_count 增长判断）
 
@@ -517,6 +344,23 @@ class VideoStream:
                 # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
                 # demux 线程仍在后台拉流保活，RTSP 不会断
                 if shared_data.exam_state == ExamState.IDLE:
+                    # IDLE 健康探测：周期验证流可解，维护 is_healthy 供 /start 非阻塞检查。
+                    # 连续 3 次失败触发 force_reconnect 自愈（reader 是 daemon 线程，
+                    # 卡死只影响该路自愈，不影响 HTTP 响应）。
+                    if self.use_dvpp and self.dvpp_decoder:
+                        _now = time.time()
+                        if _now - self._last_probe_time >= 2.0:
+                            self._last_probe_time = _now
+                            _was_healthy = self.is_healthy
+                            self.probe_health()
+                            if not self.is_healthy:
+                                if self._probe_fail_count >= 3 and self._probe_fail_count % 3 == 0:
+                                    logger.warning(f"IDLE 健康探测失败 {self._probe_fail_count} 次，触发重连")
+                                    if self.force_reconnect():
+                                        self.is_healthy = True
+                                        self._probe_fail_count = 0
+                            elif not _was_healthy:
+                                logger.info("IDLE 健康探测恢复")
                     time.sleep(0.5)
                     continue
 
@@ -534,7 +378,7 @@ class VideoStream:
                             except Exception:
                                 pass
                             self._consecutive_failures = 0
-                            frame = bgr_frame  # BGR 帧用于显示/录制
+                            frame = bgr_frame  # BGR 帧用于显示
 
                             # AIPP 零拷贝推理：直接传 device buffer，同时传 BGR 帧用于分类裁剪
                             # 仅 RUNNING 状态推理，STARTING 期间只读帧供三级校验
@@ -624,10 +468,6 @@ class VideoStream:
                 # 读帧计数（STARTING/RUNNING 都递增），供 is_streaming 校验帧产出
                 with shared_data.data_lock:
                     shared_data.frame_count += 1
-
-                # 录制视频：仅 RUNNING 状态录制
-                if shared_data.exam_state == ExamState.RUNNING and self.video_recorder is not None:
-                    self.video_recorder.write(frame)
 
                 # 执行检测（AIPP 模式已在上面处理，跳过）
                 if not use_aipp and shared_data.exam_state == ExamState.RUNNING:

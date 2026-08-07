@@ -6,12 +6,49 @@ from typing import List, Optional, Dict
 from datetime import datetime
 
 
-class ExamState:
-    """考试状态机：统一管理读帧/推理/录制的生命周期，替代 is_running + is_recording 双布尔
+# ===================== 服务保活：启动锁超时兜底 =====================
+# _handle_start 锁等待超时：若上一次 /start 卡在锁内（reader 自愈 force_reconnect），
+# 新请求不会无限挂起。AIPP 路径 /start 毫秒级（非阻塞查 is_healthy），10s 仅兜底。
+START_LOCK_TIMEOUT = 10.0
 
-    IDLE      待考：读帧线程睡眠，不推理不录制
-    STARTING  /start 进行中：读帧线程读帧供三级校验，但跳过推理和录制
-    RUNNING   考试中：完整推理 + 录制
+
+class _LockTimeout(Exception):
+    """带超时锁获取失败时抛出，供 _handle_start 捕获后快速返回。"""
+    pass
+
+
+class _TimedLock:
+    """带超时的 threading.Lock 上下文管理器：超时未获锁抛 _LockTimeout 而非死等。"""
+
+    def __init__(self, lock, timeout, name="lock"):
+        self._lock = lock
+        self._timeout = timeout
+        self._name = name
+        self._acquired = False
+
+    def __enter__(self):
+        self._acquired = self._lock.acquire(timeout=self._timeout)
+        if not self._acquired:
+            raise _LockTimeout(
+                f"系统繁忙，上一次启动未结束（等待 {self._timeout:.0f}s 未获得 {self._name}），请稍后重试")
+        return self
+
+    def __exit__(self, *exc):
+        if self._acquired:
+            self._lock.release()
+        return False
+
+
+# /start 启动串行锁：防止多个 /start 并发 force_reconnect 同一 DVPP 解码器（507018/损坏）
+START_LOCK = threading.Lock()
+
+
+class ExamState:
+    """考试状态机：统一管理读帧/推理的生命周期
+
+    IDLE      待考：读帧线程睡眠，不推理
+    STARTING  /start 进行中：读帧线程读帧供校验，但跳过推理
+    RUNNING   考试中：完整推理
     """
     IDLE = 0
     STARTING = 1
@@ -76,7 +113,7 @@ class SharedData:
         # 当前用户ID
         self.current_user_id: str = ""
 
-        # 考试状态机（替代 is_running + is_recording）
+        # 考试状态机
         self.exam_state: int = ExamState.IDLE
 
         # 最新检测结果
@@ -86,7 +123,7 @@ class SharedData:
         # 已识别的标志牌（用于去重）
         self.recognized_signs: Dict[str, bool] = {}
 
-        # 视频录制器引用
+        # VideoStream 引用（HTTP 层通过它访问 dvpp_decoder；不再做服务端录制）
         self.video_recorder = None
 
         # 视频帧尺寸

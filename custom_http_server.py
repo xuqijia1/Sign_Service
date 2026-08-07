@@ -7,7 +7,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any
 
-from SharedData import shared_data, DetectionBox, SignResult, get_sign_type, ExamState
+from SharedData import (shared_data, DetectionBox, SignResult, get_sign_type, ExamState,
+                        START_LOCK, START_LOCK_TIMEOUT, _TimedLock, _LockTimeout)
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +104,8 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             <h1>Sign Service - 标志牌识别服务</h1>
             <div class="api-list">
                 <h2>API接口</h2>
-                <div class="api-item"><span class="method">GET</span> /api/Start?userid=xxx - 开始识别/录制</div>
-                <div class="api-item"><span class="method">GET</span> /api/Stop?userid=xxx - 停止识别/录制</div>
+                <div class="api-item"><span class="method">GET</span> /api/Start?userid=xxx - 开始识别</div>
+                <div class="api-item"><span class="method">GET</span> /api/Stop?userid=xxx - 停止识别</div>
                 <div class="api-item"><span class="method">GET</span> /api/sign_boxes - 获取检测框数据</div>
                 <div class="api-item"><span class="method">GET</span> /api/sign_results - 获取识别结果</div>
                 <div class="api-item"><span class="method">GET</span> /api/status - 获取服务状态</div>
@@ -126,107 +127,63 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_error_response('缺少userid参数')
             return
 
-        # 停止之前的码流录制
-        vs = shared_data.video_recorder
-        if vs and vs.dvpp_decoder is not None and vs.dvpp_decoder.is_recording:
-            try:
-                vs.dvpp_decoder.stop_record()
-            except Exception as e:
-                logger.warning(f"停止码流录制异常: {e}")
+        try:
+            with _TimedLock(START_LOCK, START_LOCK_TIMEOUT, "START_LOCK"):
+                vs = shared_data.video_recorder
 
-        # 设置用户ID
-        shared_data.current_user_id = userid
+                # 设置用户ID + 重置状态
+                shared_data.current_user_id = userid
+                shared_data.recognized_signs = {}
+                shared_data.latest_boxes = []
+                shared_data.latest_result = None
+                shared_data.frame_count = 0
 
-        # 重置状态
-        shared_data.recognized_signs = {}
-        shared_data.latest_boxes = []
-        shared_data.latest_result = None
-        shared_data.frame_count = 0
+                # 提前设置 STARTING 唤醒读帧线程（非 AIPP 路径 is_streaming 依赖 frame_count 增长）
+                shared_data.set_exam_state(ExamState.STARTING)
 
-        # DVPP 解码器软复位，清除之前断流脏状态
-        if vs is not None and vs.dvpp_decoder is not None:
-            try:
-                vs.dvpp_decoder.soft_reset()
-            except Exception as e:
-                logger.warning(f"解码器软复位异常: {e}")
+                # 视频源就绪检查：AIPP 由 reader IDLE 探测维护 is_healthy（非阻塞毫秒级）；
+                # 非 AIPP 兼容路径用短超时 is_streaming 验证。
+                # 不 soft_reset / 不主动重连（流生命周期由 reader 管理，Stop 已 soft_reset）
+                if vs is not None and vs.use_dvpp:
+                    use_aipp = vs.config.get('AscendAipp', False)
+                    if use_aipp:
+                        if not vs.is_healthy:
+                            shared_data.set_exam_state(ExamState.IDLE)
+                            self._send_error_response('视频源未就绪，请稍后重试')
+                            return
+                    else:
+                        if not vs.is_streaming(max_wait=3):
+                            shared_data.set_exam_state(ExamState.IDLE)
+                            self._send_error_response('无法从视频源获取有效帧，请检查视频连接')
+                            return
 
-        # 提前设置 exam_state=STARTING，唤醒读帧线程（IDLE 时读帧线程在 sleep）
-        # 三级恢复的 is_streaming 依赖 frame_count 增长，而 frame_count 由读帧线程更新
-        # STARTING 期间读帧线程读帧，但推理和录制跳过
-        shared_data.set_exam_state(ExamState.STARTING)
+                # 进入 RUNNING 状态（启动推理）
+                shared_data.set_exam_state(ExamState.RUNNING)
 
-        # 帧校验 + 三级恢复：确保视频源可用后再开始考试
-        if vs is not None and vs.use_dvpp:
-            # Level 1: 等帧流 15s（自动重连可能已完成）
-            if not vs.is_streaming(max_wait=15):
-                # Level 2: soft_reset + 等帧 10s
-                if vs.dvpp_decoder is not None:
-                    try:
-                        vs.dvpp_decoder.soft_reset()
-                    except Exception:
-                        pass
-                if not vs.is_streaming(max_wait=10):
-                    # Level 3: 强制完整重连 + 等帧 30s
-                    logger.warning("soft_reset 未恢复，强制 DVPP 完整重连...")
-                    vs.force_reconnect()
-                    if not vs.is_streaming(max_wait=30):
-                        # 三级恢复全失败，恢复待考状态
-                        shared_data.set_exam_state(ExamState.IDLE)
-                        self._send_error_response('无法从视频源获取有效帧，请检查视频连接')
-                        return
+                logger.info(f"开始识别: userid={userid}")
 
-        # 启动码流录制
-        video_path = ""
-        use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and
-                          hasattr(vs.dvpp_decoder, 'start_record'))
-        if use_stream_rec:
-            date_str = datetime.now().strftime("%Y%m%d")
-            time_str = datetime.now().strftime("%H%M%S")
-            video_dir = os.path.join(vs._video_save_dir, date_str, userid)
-            os.makedirs(video_dir, exist_ok=True)
-            video_path = os.path.join(video_dir, f"sign_record_{userid}_{time_str}.mp4")
-            try:
-                vs.dvpp_decoder.start_record(video_path)
-                logger.info(f"PyAV 码流录制启动: {video_path}")
-            except Exception as e:
-                logger.warning(f"码流录制启动失败({e})")
-                video_path = ""
-
-        # 录制启动成功，进入 RUNNING 状态（启动推理 + 录制写入）
-        shared_data.set_exam_state(ExamState.RUNNING)
-
-        logger.info(f"开始识别: userid={userid}")
-
-        self._send_json_response({
-            'type': 'GET',
-            'path': '/api/Start',
-            'userid': userid,
-            'video_path': video_path,
-            'status': 'started'
-        })
+                self._send_json_response({
+                    'type': 'GET',
+                    'path': '/api/Start',
+                    'userid': userid,
+                    'status': 'started'
+                })
+        except _LockTimeout as e:
+            logger.error(str(e))
+            self._send_error_response(str(e))
+        except Exception as e:
+            logger.error(f"考试启动异常：{e}", exc_info=True)
+            shared_data.set_exam_state(ExamState.IDLE)
+            self._send_error_response(f"考试启动异常：{str(e)}")
 
     def _handle_stop(self, query_params: dict):
         """处理停止请求"""
         userid = query_params.get('userid', [''])[0]
 
-        # 停止录制
-        video_path = ""
-        vs = shared_data.video_recorder
-        use_stream_rec = (vs is not None and vs.dvpp_decoder is not None and
-                          vs.dvpp_decoder.is_recording)
-        if use_stream_rec:
-            try:
-                rec_mp4 = vs.dvpp_decoder.stop_record()
-                if rec_mp4:
-                    video_path = rec_mp4
-                logger.info(f"码流录制停止: {video_path}")
-            except Exception as e:
-                logger.warning(f"码流录制停止异常: {e}")
-
         # 获取识别结果
         results = shared_data.get_all_results()
 
-        # 重置状态：IDLE 同时停止读帧/推理/录制
+        # 重置状态：IDLE 同时停止读帧/推理
         shared_data.set_exam_state(ExamState.IDLE)
         shared_data.current_user_id = ""
 
@@ -238,13 +195,12 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning(f"DVPP soft_reset 异常: {e}")
 
-        logger.info(f"停止识别: userid={userid}, video_path={video_path}")
+        logger.info(f"停止识别: userid={userid}")
 
         self._send_json_response({
             'type': 'GET',
             'path': '/api/Stop',
             'userid': userid,
-            'video_path': video_path,
             'recognized_signs': results.get('recognized_signs', []),
             'frame_count': results.get('frame_count', 0),
             'status': 'stopped'
