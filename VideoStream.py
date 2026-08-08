@@ -92,15 +92,15 @@ class VideoStream:
             logger.error(f"模型加载失败: {e}")
             return
 
-        # Ascend 环境 DVPP 硬解码：create_dvpp_decoder 失败抛 RuntimeError，不回退 cv2
+        # Ascend 环境 DVPP 硬解码：摄像头未开/不可达时不崩服务，留 dvpp_decoder=None 由 _process_loop 后台重连自愈
         if _HAS_DVPP and self.camera_url.startswith('rtsp://'):
+            self.use_dvpp = True  # 先置位，避免创建失败时误掉 cv2 分支（cap=None 必崩）
             try:
                 self.dvpp_decoder = create_dvpp_decoder(
                     rtsp_url=self.camera_url,
                     device_id=int(self.cuda_device) if self.device_type == 'ascend' else 0,
                     en_type="H264",
                 )
-                self.use_dvpp = True
                 self.frame_width = self.dvpp_decoder.src_width or 1920
                 self.frame_height = self.dvpp_decoder.src_height or 1080
                 self.frame_fps = self.dvpp_decoder.fps or 25.0
@@ -111,9 +111,10 @@ class VideoStream:
                 logger.info(f"DVPP 硬解码已启动: {self.camera_url} | "
                             f"{self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f}fps")
             except Exception as e:
-                # Ascend 环境硬解码失败不回退 cv2，向上抛异常由调用方决定重试或终止
-                logger.error(f"DVPP 硬解码启动失败（不回退 cv2）: {e}")
-                raise RuntimeError(f"DVPP 硬解码启动失败（不回退 cv2）: {e}")
+                # 摄像头未开/不可达：不崩服务，留 dvpp_decoder=None，由 _process_loop IDLE 触发 force_reconnect 后台重连
+                # （与 ydpt 一致：服务能启动，/start 查 is_healthy 非阻塞拒绝）
+                self.dvpp_decoder = None
+                logger.error(f"DVPP 硬解码启动失败（不回退 cv2，_process_loop 将后台重连）: {e}")
 
         # 非 Ascend 环境：使用 cv2 软解码作为兼容方案
         if not self.use_dvpp:
@@ -344,10 +345,13 @@ class VideoStream:
                 # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
                 # demux 线程仍在后台拉流保活，RTSP 不会断
                 if shared_data.exam_state == ExamState.IDLE:
+                    # 解码器未建（启动时摄像头未开）：尝试创建，成功后下个周期开始健康探测
+                    if self.use_dvpp and self.dvpp_decoder is None:
+                        self.force_reconnect()
                     # IDLE 健康探测：周期验证流可解，维护 is_healthy 供 /start 非阻塞检查。
                     # 连续 3 次失败触发 force_reconnect 自愈（reader 是 daemon 线程，
                     # 卡死只影响该路自愈，不影响 HTTP 响应）。
-                    if self.use_dvpp and self.dvpp_decoder:
+                    elif self.use_dvpp and self.dvpp_decoder:
                         _now = time.time()
                         if _now - self._last_probe_time >= 2.0:
                             self._last_probe_time = _now

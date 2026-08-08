@@ -747,6 +747,7 @@ class AclVdecDecoder(BaseVideoDecoder):
         此线程独占 PyAV container，不与其他线程共享。
         连接断开后自动重试，直到 _demux_running 被设为 False。
         """
+        self._demux_retry_count = 0
         while self._demux_running:
             container = None
             try:
@@ -754,6 +755,7 @@ class AclVdecDecoder(BaseVideoDecoder):
                     'rtsp_transport': 'tcp', 'stimeout': '5000000'})
                 video_stream = container.streams.video[0]
                 self._video_stream = video_stream
+                self._demux_retry_count = 0  # 连接成功，重置退避计数
 
                 for packet in container.demux([video_stream]):
                     if not self._demux_running:
@@ -768,18 +770,22 @@ class AclVdecDecoder(BaseVideoDecoder):
                         pass
 
             except _av.error.EOFError:
-                print(f"[AclVdec] demux 线程: RTSP 流 EOF，5秒后重试")
+                self._demux_retry_count += 1
+                if self._demux_retry_count == 1 or self._demux_retry_count % 10 == 0:
+                    print(f"[AclVdec] demux 线程: RTSP 流 EOF，第 {self._demux_retry_count} 次重试，{min(5 * self._demux_retry_count, 60)}s 后重试")
             except Exception as e:
-                print(f"[AclVdec] demux 线程异常: {e}，5秒后重试")
+                self._demux_retry_count += 1
+                if self._demux_retry_count == 1 or self._demux_retry_count % 10 == 0:
+                    print(f"[AclVdec] demux 线程异常: {e}，第 {self._demux_retry_count} 次重试，{min(5 * self._demux_retry_count, 60)}s 后重试")
             finally:
                 if container is not None:
                     try:
                         container.close()
                     except Exception:
                         pass
-            # 连接断开，等待后重试
+            # 连接断开，指数退避后重试（5/10/15/.../60s 封顶）
             if self._demux_running:
-                time.sleep(5)
+                time.sleep(min(5 * self._demux_retry_count, 60))
         # 退出循环时清理
         self._demux_running = False
 
