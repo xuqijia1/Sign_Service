@@ -143,7 +143,7 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
 
                 # 视频源就绪检查：AIPP 由 reader IDLE 探测维护 is_healthy（非阻塞毫秒级）；
                 # 非 AIPP 兼容路径用短超时 is_streaming 验证。
-                # 不 soft_reset / 不主动重连（流生命周期由 reader 管理，Stop 已 soft_reset）
+                # 不 soft_reset / 不主动重连（流生命周期由 reader 管理，视频流常驻）
                 if vs is not None and vs.use_dvpp:
                     use_aipp = vs.config.get('AscendAipp', False)
                     if use_aipp:
@@ -156,6 +156,14 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
                             shared_data.set_exam_state(ExamState.IDLE)
                             self._send_error_response('无法从视频源获取有效帧，请检查视频连接')
                             return
+
+                # 清空 IDLE 期间堆积的旧 NAL/帧，让主循环从实时帧开始检测（视频流常驻模式）
+                if vs is not None and vs.use_dvpp and vs.dvpp_decoder is not None:
+                    try:
+                        if hasattr(vs.dvpp_decoder, 'clear_stale_queues'):
+                            vs.dvpp_decoder.clear_stale_queues()
+                    except Exception as e:
+                        logger.warning(f"clear_stale_queues 异常: {e}")
 
                 # 进入 RUNNING 状态（启动推理）
                 shared_data.set_exam_state(ExamState.RUNNING)
@@ -187,13 +195,9 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         shared_data.set_exam_state(ExamState.IDLE)
         shared_data.current_user_id = ""
 
-        # soft_reset 清理 DVPP 脏状态，避免下次 /start 残留旧帧
-        vs2 = shared_data.video_recorder
-        if vs2 is not None and vs2.dvpp_decoder is not None:
-            try:
-                vs2.dvpp_decoder.soft_reset()
-            except Exception as e:
-                logger.warning(f"DVPP soft_reset 异常: {e}")
+        # 视频流常驻：Stop 不 soft_reset（soft_reset 会断 demux 线程 + 发 EOS 破坏 VDEC
+        # 序列头上下文，导致下次 /start 时 VDEC 退化空窗 sent>0 cb=0）。
+        # IDLE 期间 demux 持续拉流保活，/start 调 clear_stale_queues 丢弃旧帧即可。
 
         logger.info(f"停止识别: userid={userid}")
 

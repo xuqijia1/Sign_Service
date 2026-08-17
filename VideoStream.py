@@ -130,6 +130,8 @@ class VideoStream:
         self.is_healthy = False  # 流健康标志（IDLE 时由 _process_loop 探测维护，/start 非阻塞检查）
         self._last_probe_time = 0.0  # 上次健康探测时间
         self._probe_fail_count = 0  # 连续探测失败次数
+        self._sustained_failure_cycles = 0  # 持续失败周期计数，用于 escalating backoff（长时间断连降频）
+        self._next_force_reconnect_ts = 0.0  # 下次允许 force_reconnect 的时间戳（backoff 退避）
 
         # 启动处理线程
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
@@ -242,6 +244,37 @@ class VideoStream:
         finally:
             self._force_reconnecting = False
 
+    def _try_force_reconnect(self, reason=""):
+        """带 escalating backoff 的 force_reconnect 包装。
+
+        长时间断连（摄像头断电）期间，若每次 probe 失败都立即 force_reconnect，
+        14 小时会产生数千次 release/create VDEC 通道，易致 507018 通道耗尽，
+        反而使摄像头恢复后也无法重建解码器（/start 400）。
+        按 _sustained_failure_cycles 递增退避：30/60/120/300s 封顶。
+        流恢复（is_healthy=True）时由调用方清零计数。
+        """
+        _now = time.time()
+        if _now < self._next_force_reconnect_ts:
+            return False  # 退避中，跳过本次重连
+        if reason:
+            logger.warning(f"{reason}触发重连（持续失败 {self._sustained_failure_cycles} 周期）")
+        ok = self.force_reconnect()
+        # 无论本次是否建成解码器，都按持续失败周期递增退避；
+        # 真正恢复会在下次 probe 健康（is_healthy=True）时由调用方清零
+        self._sustained_failure_cycles += 1
+        if self._sustained_failure_cycles <= 3:
+            _backoff = 30.0
+        elif self._sustained_failure_cycles <= 6:
+            _backoff = 60.0
+        elif self._sustained_failure_cycles <= 12:
+            _backoff = 120.0
+        else:
+            _backoff = 300.0  # 上限 5 分钟
+        self._next_force_reconnect_ts = _now + _backoff
+        if self._sustained_failure_cycles in (1, 4, 7, 13):
+            logger.info(f"[FORCE-RECONNECT] 持续断连 {self._sustained_failure_cycles} 周期，进入低频重连模式（{_backoff:.0f}s 间隔）")
+        return ok
+
     def probe_health(self):
         """流健康探测：拉一帧验证流可解，维护 is_healthy。
 
@@ -253,6 +286,10 @@ class VideoStream:
             self.is_healthy = False
             return False
         try:
+            # 先清空解码输出帧队列：避免读 IDLE 期间残留的旧帧假阳性
+            # （断网恢复后 VDEC 退化不解码，但 _frame_queue 残留旧帧致 is_healthy=True 误判）
+            if hasattr(self.dvpp_decoder, 'flush_decoded_frames'):
+                self.dvpp_decoder.flush_decoded_frames()
             use_aipp = self.config.get('AscendAipp', False)
             if use_aipp:
                 nv12_info, _ = self.dvpp_decoder.read_frame_aipp()
@@ -345,26 +382,24 @@ class VideoStream:
                 # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
                 # demux 线程仍在后台拉流保活，RTSP 不会断
                 if shared_data.exam_state == ExamState.IDLE:
-                    # 解码器未建（启动时摄像头未开）：尝试创建，成功后下个周期开始健康探测
+                    _now = time.time()
+                    # 解码器未建（启动时摄像头未开）：带 backoff 创建（仅 create 无 release，
+                    # 不崩同进程另一路 VDEC）
                     if self.use_dvpp and self.dvpp_decoder is None:
-                        self.force_reconnect()
+                        self._try_force_reconnect()
                     # IDLE 健康探测：周期验证流可解，维护 is_healthy 供 /start 非阻塞检查。
-                    # 连续 3 次失败触发 force_reconnect 自愈（reader 是 daemon 线程，
-                    # 卡死只影响该路自愈，不影响 HTTP 响应）。
+                    # 探测失败时仅靠 read_frame 内部软恢复（_check_starvation -> _reconnect_demux，
+                    # 保留 VDEC 通道），不 force_reconnect：同进程双摄像头下 release/重建会崩另一路
+                    # VDEC（project_dvpp_same_process_dual_vdec）。demux 自愈后 probe 自然恢复。
                     elif self.use_dvpp and self.dvpp_decoder:
-                        _now = time.time()
                         if _now - self._last_probe_time >= 2.0:
                             self._last_probe_time = _now
                             _was_healthy = self.is_healthy
                             self.probe_health()
-                            if not self.is_healthy:
-                                if self._probe_fail_count >= 3 and self._probe_fail_count % 3 == 0:
-                                    logger.warning(f"IDLE 健康探测失败 {self._probe_fail_count} 次，触发重连")
-                                    if self.force_reconnect():
-                                        self.is_healthy = True
-                                        self._probe_fail_count = 0
-                            elif not _was_healthy:
+                            if self.is_healthy and not _was_healthy:
                                 logger.info("IDLE 健康探测恢复")
+                                self._sustained_failure_cycles = 0
+                                self._next_force_reconnect_ts = 0.0
                     time.sleep(0.5)
                     continue
 
@@ -419,9 +454,8 @@ class VideoStream:
                             if self._consecutive_failures > 10:
                                 now_ts = time.time()
                                 if now_ts - self._last_dvpp_warn_ts > 30:
-                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
+                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，等待 read 内部看门狗自愈")
                                     self._last_dvpp_warn_ts = now_ts
-                                self.dvpp_decoder.soft_reset()
                                 self._consecutive_failures = 0
                             time.sleep(0.05)
                             continue
@@ -442,9 +476,8 @@ class VideoStream:
                             if self._consecutive_failures > 10:
                                 now_ts = time.time()
                                 if now_ts - self._last_dvpp_warn_ts > 30:
-                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，执行软复位清空缓存")
+                                    logger.warning(f"DVPP 连续读取失败{self._consecutive_failures}次，等待 read 内部看门狗自愈")
                                     self._last_dvpp_warn_ts = now_ts
-                                self.dvpp_decoder.soft_reset()
                                 self._consecutive_failures = 0
                             time.sleep(0.05)
                             continue
