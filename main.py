@@ -85,8 +85,6 @@ def load_config():
         "CudaDevice": 0,
         "confidence_threshold": 0.5,
         "video_save_dir": "./videos",
-        "client_url": "http://127.0.0.1:8090",
-        "push_interval": 0.1,
         "cpu_cores": None
     }
 

@@ -4,7 +4,6 @@ import cv2
 import time
 import threading
 import logging
-import requests
 import json
 from datetime import datetime
 from typing import Optional, List
@@ -32,8 +31,6 @@ class VideoStream:
         self.device_type = config.get('DeviceType', 'gpu')
         self.cuda_device = config.get('CudaDevice', 0)
         self.confidence_threshold = config.get('confidence_threshold', 0.5)
-        self.client_url = config.get('client_url', 'http://127.0.0.1:8090')
-        self.push_interval = config.get('push_interval', 0.1)
 
         # 视频源
         self.cap: Optional[cv2.VideoCapture] = None
@@ -51,10 +48,6 @@ class VideoStream:
 
         # VideoStream 引用，供 HTTP 层访问 dvpp_decoder（不再做服务端录制）
         shared_data.video_recorder = self
-
-        # 推送控制
-        self.last_push_time = 0.0
-        self.push_thread: Optional[threading.Thread] = None
 
     def start(self):
         """启动视频流处理"""
@@ -137,10 +130,6 @@ class VideoStream:
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
 
-        # 启动推送线程
-        self.push_thread = threading.Thread(target=self._push_loop, daemon=True)
-        self.push_thread.start()
-
         logger.info("视频流处理已启动")
 
     def stop(self):
@@ -150,10 +139,6 @@ class VideoStream:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
             self.thread = None
-
-        if self.push_thread is not None:
-            self.push_thread.join(timeout=2.0)
-            self.push_thread = None
 
         if self.dvpp_decoder is not None:
             self.dvpp_decoder.release()
@@ -556,75 +541,6 @@ class VideoStream:
             except Exception as e:
                 logger.error(f"处理帧异常: {e}")
                 time.sleep(0.1)
-
-    def _push_loop(self):
-        """推送结果到客户端"""
-        while self.is_running:
-            try:
-                if shared_data.exam_state == ExamState.IDLE:
-                    time.sleep(0.1)
-                    continue
-
-                current_time = time.time()
-                if current_time - self.last_push_time < self.push_interval:
-                    time.sleep(0.01)
-                    continue
-
-                self.last_push_time = current_time
-
-                # 获取最新结果
-                result = shared_data.get_result()
-                if result is None:
-                    continue
-
-                # 推送到客户端
-                self._push_to_client(result)
-
-            except Exception as e:
-                logger.error(f"推送结果异常: {e}")
-                time.sleep(0.1)
-
-    def _push_to_client(self, result: SignResult):
-        """推送结果到客户端"""
-        try:
-            url = f"{self.client_url}/sign_return"
-
-            data = {
-                "SignType": result.SignType,
-                "SignName": result.SignName,
-                "IsCorrect": result.IsCorrect,
-                "Confidence": result.Confidence,
-                "Boxes": [
-                    {
-                        "X": b.X,
-                        "Y": b.Y,
-                        "Width": b.Width,
-                        "Height": b.Height,
-                        "Label": b.Label,
-                        "Confidence": b.Confidence
-                    }
-                    for b in result.Boxes
-                ]
-            }
-
-            response = requests.post(url, json=data, timeout=1.0)
-            if response.status_code == 200:
-                # 同类型标志牌只记录一次推送日志
-                if not hasattr(self, '_last_pushed_type') or self._last_pushed_type != result.SignType:
-                    self._last_pushed_type = result.SignType
-                    logger.info(f"推送成功: {result.SignType} - {result.SignName}")
-            else:
-                # 推送失败只记录一次
-                if not hasattr(self, '_push_fail_logged') or not self._push_fail_logged:
-                    self._push_fail_logged = True
-                    logger.warning(f"推送失败: {response.status_code} (后续不再重复提示)")
-
-        except requests.exceptions.RequestException as e:
-            if not hasattr(self, '_push_fail_logged') or not self._push_fail_logged:
-                self._push_fail_logged = True
-                logger.warning(f"推送请求失败: {e} (后续不再重复提示)")
-        except Exception as e:
-            logger.error(f"推送异常: {e}")
 
     def _draw_boxes(self, frame, boxes: List[DetectionBox]):
         """在帧上绘制检测框"""

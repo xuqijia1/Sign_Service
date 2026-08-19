@@ -131,12 +131,6 @@ class SharedData:
         self.frame_height: int = 1080
         self.frame_fps: float = 25.0
 
-        # 推送客户端URL
-        self.client_url: str = "http://127.0.0.1:8090"
-
-        # 推送间隔
-        self.push_interval: float = 0.1
-
         # 数据锁
         self.data_lock = threading.Lock()
 

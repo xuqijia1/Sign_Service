@@ -64,26 +64,9 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """处理POST请求"""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
-
-        try:
-            # 读取请求体
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
-            data = json.loads(body) if body else {}
-
-            if path == '/sign_return':
-                self._handle_sign_return(data)
-            elif path == '/api/set_config':
-                self._handle_set_config(data)
-            else:
-                self._send_error_response('Not Found', 404)
-        except json.JSONDecodeError as e:
-            self._send_error_response(f'Invalid JSON: {e}', 400)
-        except Exception as e:
-            logger.error(f"处理POST请求异常: {e}")
-            self._send_error_response(str(e), 500)
+        # /sign_return（识别结果推送）与 /api/set_config（client_url/push_interval 注册）
+        # 已随服务端推送一并移除：客户端改为轮询 /api/sign_results、/api/sign_boxes 获取结果
+        self._send_error_response('Not Found', 404)
 
     def _handle_index(self):
         """处理首页请求"""
@@ -109,7 +92,6 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
                 <div class="api-item"><span class="method">GET</span> /api/sign_boxes - 获取检测框数据</div>
                 <div class="api-item"><span class="method">GET</span> /api/sign_results - 获取识别结果</div>
                 <div class="api-item"><span class="method">GET</span> /api/status - 获取服务状态</div>
-                <div class="api-item"><span class="method">POST</span> /sign_return - 接收识别结果（客户端回调）</div>
             </div>
         </body>
         </html>
@@ -275,25 +257,6 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         }
 
         self._send_json_response(data)
-
-    def _handle_sign_return(self, data: dict):
-        """处理识别结果回调（客户端调用）"""
-        # 这个接口通常由服务端推送到客户端，但也可以接收客户端的请求
-        logger.info(f"收到识别结果回调: {data.get('SignName', '')}")
-
-        self._send_json_response({'success': True})
-
-    def _handle_set_config(self, data: dict):
-        """处理设置配置请求"""
-        if 'client_url' in data:
-            shared_data.client_url = data['client_url']
-        if 'push_interval' in data:
-            shared_data.push_interval = float(data['push_interval'])
-
-        logger.info(f"配置已更新: {data}")
-
-        self._send_json_response({'success': True, 'config': data})
-
 
 def run_server(port: int = 8090):
     """运行HTTP服务器"""
