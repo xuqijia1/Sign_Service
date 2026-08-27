@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import time
 import os
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -155,12 +156,13 @@ class BaseInferenceEngine:
         self.names = names or load_class_names()
         self._infer_count = 0
 
-    def infer(self, image, orig_size=None):
+    def infer(self, image, orig_size=None, bgr_image=None):
         """
         执行推理
 
         Args:
             image: BGR 格式图片 (numpy array)
+            bgr_image: 兼容 SignModel.detect 透传的 AIPP 参数，非 AIPP 引擎忽略
             orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
 
         Returns:
@@ -281,9 +283,12 @@ class CUDAInferenceEngine(BaseInferenceEngine):
             dummy = np.zeros((224, 224, 3), dtype=np.uint8)
             self.cls_model.predict(dummy, device=self.device, verbose=False)
 
-            # 获取分类模型的类别名称
+            # 获取分类模型的类别名称（剥掉 NN_ 数字前缀，与 Ascend 的 classes_cls.txt 对齐：
+            # sign_cls.pt 的 .names 带 "00_" 前缀而 classes_cls.txt 没有，不剥则 CUDA 推
+            # "01_warning_electric"、Ascend 推 "warning_electric"，display_names/get_sign_type/客户端匹配全失配）
             if hasattr(self.cls_model, 'names'):
-                self.cls_names = [self.cls_model.names[i] for i in sorted(self.cls_model.names.keys())]
+                self.cls_names = [re.sub(r'^\d{1,2}_', '', self.cls_model.names[i])
+                                  for i in sorted(self.cls_model.names.keys())]
 
             logger.info(f"[CUDAInferenceEngine] 分类模型加载成功: {cls_path} | 类别数: {len(self.cls_names)} | 设备: {self.device}")
         except Exception as e:
@@ -291,12 +296,13 @@ class CUDAInferenceEngine(BaseInferenceEngine):
             self.cls_model = None
             self.cls_model_path = None
 
-    def infer(self, image, orig_size=None):
+    def infer(self, image, orig_size=None, bgr_image=None):
         """执行推理（检测 + 分类二级串联）
 
         Args:
             image: BGR numpy 数组
             orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
+            bgr_image: 兼容 SignModel.detect 透传的 AIPP 参数，CUDA/CPU 路径直接用 image
         """
         t0 = time.time()
 
