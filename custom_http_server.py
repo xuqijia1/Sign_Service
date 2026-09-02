@@ -170,12 +170,16 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
         """处理停止请求"""
         userid = query_params.get('userid', [''])[0]
 
-        # 获取识别结果
+        # 先快照本场识别结果（响应体照常带回完整数据），随后当场清空：
+        # 原"Stop 不清结果、下一位 /start 才清"的契约下，两场之间
+        # /api/sign_results 一直返回上一考生的完整残留数据，只能靠客户端闸门挡；
+        # 现改为 Stop 即清，残留窗口在源头关闭（/start 的清理仍保留，双保险）
         results = shared_data.get_all_results()
 
         # 重置状态：IDLE 同时停止读帧/推理
         shared_data.set_exam_state(ExamState.IDLE)
         shared_data.current_user_id = ""
+        shared_data.clear_results()
 
         # 视频流常驻：Stop 不 soft_reset（soft_reset 会断 demux 线程 + 发 EOS 破坏 VDEC
         # 序列头上下文，导致下次 /start 时 VDEC 退化空窗 sent>0 cb=0）。

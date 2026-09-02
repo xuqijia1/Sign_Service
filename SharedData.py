@@ -171,6 +171,14 @@ class SharedData:
             if result.SignName:
                 self.recognized_signs[result.SignName] = True
 
+    def clear_results(self):
+        """清空识别结果（/api/Stop 当场调用：两场之间轮询接口不再返回上一考生残留；
+        frame_count/start_time 不动，/start 仍有自己的全量清理）"""
+        with self.data_lock:
+            self.latest_boxes = []
+            self.latest_result = None
+            self.recognized_signs = {}
+
     def get_boxes(self) -> List[DetectionBox]:
         """获取最新检测框"""
         with self.data_lock:
