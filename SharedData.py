@@ -1,9 +1,12 @@
 # SharedData.py - 全局共享数据模块
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 # ===================== 服务保活：启动锁超时兜底 =====================
@@ -120,8 +123,14 @@ class SharedData:
         self.latest_boxes: List[DetectionBox] = []
         self.latest_result: Optional[SignResult] = None
 
-        # 已识别的标志牌（用于去重）
+        # 已识别的标志牌（用于去重，仅收录多帧稳定确认后的标签）
         self.recognized_signs: Dict[str, bool] = {}
+
+        # 多帧确认：各标签连续命中帧计数（本帧未出现即清零）
+        self.label_streaks: Dict[str, int] = {}
+
+        # 确认阈值：连续命中该帧数才写入 recognized_signs（挡单帧闪现误检）
+        self.confirm_frames: int = 5
 
         # VideoStream 引用（HTTP 层通过它访问 dvpp_decoder；不再做服务端录制）
         self.video_recorder = None
@@ -148,6 +157,7 @@ class SharedData:
             self.latest_boxes = []
             self.latest_result = None
             self.recognized_signs = {}
+            self.label_streaks = {}
             self.frame_count = 0
             self.start_time = 0.0
 
@@ -159,17 +169,31 @@ class SharedData:
                 self.start_time = time.time()
 
     def update_detections(self, boxes: List[DetectionBox]):
-        """更新检测结果（frame_count 由读帧线程递增，此处不重复）"""
+        """更新检测结果（frame_count 由读帧线程递增，此处不重复）。
+        多帧确认：各标签连续命中计数，本帧未出现即清零；连续命中达 confirm_frames
+        才写入 recognized_signs——单帧/短暂闪现的误检（反光、遮挡、快速挥动）
+        进不了累计集，客户端不再一帧定对错。仅在 RUNNING 期间被调用。"""
         with self.data_lock:
             self.latest_boxes = boxes
 
+            # 同帧同标签只计1次（画面里多块同款牌不能一帧凑满阈值）
+            present = {b.Label for b in boxes if b.Label}
+            for label in present:
+                self.label_streaks[label] = self.label_streaks.get(label, 0) + 1
+                if self.label_streaks[label] >= self.confirm_frames and label not in self.recognized_signs:
+                    self.recognized_signs[label] = True
+                    logger.info(f"标志牌多帧确认: {label} 连续{self.label_streaks[label]}帧命中，写入累计集")
+
+            # 上一帧在、本帧不在的标签：连续性打断，计数清零
+            for label in list(self.label_streaks.keys()):
+                if label not in present:
+                    del self.label_streaks[label]
+
     def update_result(self, result: SignResult):
-        """更新识别结果"""
+        """更新识别结果（仅刷新 latest_result 供轮询展示；
+        recognized_signs 的写入统一由 update_detections 的多帧确认负责）"""
         with self.data_lock:
             self.latest_result = result
-            # 记录已识别的标志牌
-            if result.SignName:
-                self.recognized_signs[result.SignName] = True
 
     def clear_results(self):
         """清空识别结果（/api/Stop 当场调用：两场之间轮询接口不再返回上一考生残留；
@@ -178,6 +202,7 @@ class SharedData:
             self.latest_boxes = []
             self.latest_result = None
             self.recognized_signs = {}
+            self.label_streaks = {}
 
     def get_boxes(self) -> List[DetectionBox]:
         """获取最新检测框"""

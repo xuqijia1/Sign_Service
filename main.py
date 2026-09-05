@@ -84,6 +84,7 @@ def load_config():
         "cls_conf_threshold": 0.5,
         "CudaDevice": 0,
         "confidence_threshold": 0.5,
+        "confirm_frames": 5,
         "video_save_dir": "./videos",
         "cpu_cores": None
     }

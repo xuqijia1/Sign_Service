@@ -11,6 +11,7 @@
     "cls_conf_threshold": 0.5,
     "CudaDevice": 0,
     "confidence_threshold": 0.5,
+    "confirm_frames": 5,
     "push_interval": 0.5,
     "show_window": true,
     "cpu_cores": [12, 13],

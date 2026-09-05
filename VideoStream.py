@@ -49,6 +49,9 @@ class VideoStream:
         # VideoStream 引用，供 HTTP 层访问 dvpp_decoder（不再做服务端录制）
         shared_data.video_recorder = self
 
+        # 多帧确认阈值：连续命中该帧数才写入 recognized_signs（默认5，25fps约0.2s）
+        shared_data.confirm_frames = int(config.get('confirm_frames', 5))
+
     def start(self):
         """启动视频流处理"""
         if self.is_running:
