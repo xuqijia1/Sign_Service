@@ -116,6 +116,9 @@ class CustomHTTPRequestHandler(BaseHTTPRequestHandler):
                 # 设置用户ID + 重置状态
                 shared_data.current_user_id = userid
                 shared_data.recognized_signs = {}
+                # 连续命中计数一并清零：客户端 /api/Stop 是 fire-and-forget，
+                # 上一场 Stop 失败时 streaks 残留，下一位考生首帧同标签在场即达标误确认
+                shared_data.label_streaks = {}
                 shared_data.latest_boxes = []
                 shared_data.latest_result = None
                 shared_data.frame_count = 0
