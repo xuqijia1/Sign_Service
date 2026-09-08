@@ -548,6 +548,17 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
                 # 预分配输入 buffer（float32 NCHW，分类模型无 AIPP）
                 cls_input_size = acl.mdl.get_input_size_by_index(self._cls_model_desc, 0)
+                # 分类链路是 CPU float32 预处理 + H2D 直拷：模型输入必须是 float32 NCHW 字节数。
+                # 若加载到 AIPP(NV12) 输入的分类模型（旧 convert_aipp_all.sh 产出的
+                # sign_cls_aipp.om），memcpy 会把 602112B 拷进 75264B 的 device buffer
+                # 越界写坏相邻显存，且模型把 float32 字节当 NV12 解读 → 分类输出全是噪声
+                # （实测症状：任意牌被稳定识别成同一张错误牌）。加载期校验，不匹配禁用分类。
+                expected_float32 = 3 * self.cls_input_size * self.cls_input_size * 4
+                if cls_input_size != expected_float32:
+                    raise RuntimeError(
+                        f"分类模型输入 {cls_input_size}B != float32 NCHW 预期 {expected_float32}B："
+                        f"该模型是 AIPP(NV12) 输入模型，与本服务 CPU float32 分类预处理不匹配，"
+                        f"请把 ascend_aipp_cls_model_path 指向非 AIPP 的 sign_cls.om")
                 self._cls_input_dev, ret = acl.rt.malloc(cls_input_size, 2)
                 if ret != 0:
                     raise RuntimeError(f"分类输入 buffer malloc 失败: ret={ret}")
@@ -597,6 +608,15 @@ class AscendInferenceEngine(BaseInferenceEngine):
                             f"类别数: {len(self.cls_names)} | 输入: {self.cls_input_size}x{self.cls_input_size}")
         except Exception as e:
             logger.warning(f"[AscendInferenceEngine] 分类模型加载失败，将仅使用检测模型: {e}")
+            # AIPP 原生 ACL 分支半途失败时卸载并清掉 _cls_model_id（如输入格式校验不过），
+            # 服务降级为仅检测标签，不让带病模型进主循环
+            if self.aipp and getattr(self, '_cls_model_id', None) is not None:
+                try:
+                    import acl
+                    acl.mdl.unload(self._cls_model_id)
+                except Exception:
+                    pass
+                self._cls_model_id = None
             self.cls_session = None
             self.cls_model_path = None
 
@@ -612,7 +632,9 @@ class AscendInferenceEngine(BaseInferenceEngine):
         Returns:
             (cls_name, cls_conf) 或 None
         """
-        if self.aipp and hasattr(self, '_cls_model_id'):
+        # not-None 判定而非 hasattr：AIPP 分支加载失败时会把 _cls_model_id 清成 None，
+        # hasattr 仍为 True 会放行进入未完成初始化的 _classify_crop_acl
+        if self.aipp and getattr(self, '_cls_model_id', None) is not None:
             return self._classify_crop_acl(crop_img)
 
         if self.cls_session is None:
@@ -661,6 +683,12 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
             # H2D：host buffer → 预分配 device input buffer
             input_nbytes = self._cls_input_buffer.nbytes
+            # 防御：模型输入与 CPU float32 预处理字节不一致时跳过分类（保检测标签），
+            # 避免 memcpy 越界写坏相邻 device 显存
+            if input_nbytes != self._cls_input_size:
+                logger.warning(f"[AIPP-CLS] 输入不匹配: 预处理 {input_nbytes}B != 模型输入 "
+                               f"{self._cls_input_size}B，跳过分类")
+                return None
             acl.rt.memcpy(int(self._cls_input_dev), input_nbytes,
                           int(self._cls_input_buffer.ctypes.data), input_nbytes, 1)
 

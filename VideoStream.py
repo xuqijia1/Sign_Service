@@ -64,7 +64,10 @@ class VideoStream:
             # Ascend 模式：选择 OM 模型
             if use_aipp:
                 model_path = self.config.get('ascend_aipp_model_path', './sign_aipp.om')
-                cls_model_path = self.config.get('ascend_aipp_cls_model_path', './sign_cls_aipp.om')
+                # AIPP 只用于检测模型（NV12 零拷贝）；分类始终走 CPU float32 预处理，
+                # 必须用非 AIPP 的 sign_cls.om（sign_cls_aipp.om 是 NV12 输入，喂 float32
+                # 会溢出 device buffer 且分类输出为噪声）
+                cls_model_path = self.config.get('ascend_aipp_cls_model_path', './sign_cls.om')
             else:
                 model_path = self.config.get('ascend_model_path', './sign.om')
                 cls_model_path = self.config.get('ascend_cls_model_path', './sign_cls.om')

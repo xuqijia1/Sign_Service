@@ -7,7 +7,7 @@
     "ascend_model_path": "./sign.om",
     "ascend_cls_model_path": "./sign_cls.om",
     "ascend_aipp_model_path": "./sign_aipp.om",
-    "ascend_aipp_cls_model_path": "./sign_cls_aipp.om",
+    "ascend_aipp_cls_model_path": "./sign_cls.om",
     "cls_conf_threshold": 0.5,
     "CudaDevice": 0,
     "confidence_threshold": 0.5,
